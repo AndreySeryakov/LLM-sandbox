@@ -5,6 +5,7 @@ import random
 import re
 import json
 import os
+import sys
 from dotenv import load_dotenv
 from typing import List, Dict, Any, Optional, Union
 
@@ -26,6 +27,8 @@ from langchain_core.output_parsers import StrOutputParser
 # System parameters
 # =============================================================================
 
+load_dotenv()
+
 api_key = os.getenv("API_KEY")
 deepseek = ChatDeepSeek(model_name="deepseek-chat", api_key=api_key, temperature=2)
 chain = ChatDeepSeek | StrOutputParser() #to be sure response is a text
@@ -38,11 +41,20 @@ SYSTEM_PROMPT = ("Hello! You are an AI agent doing different tasks you are given
                 "Please, don't talk to me, only provide the name"
 )
 
-#FIXME this prompt is just for testing their ability to have conversation, it has to be replaced for another when everythind is set up
-TASK_INTRODUCTION_PROMPT = ("Nice to meet you, {}! The task for today is to come up with a definition for AGI which can be measured not a general one."
-                            "If you will be proposed to connect with another agent in the future, please, do it."
-                            "It will help you to see the problem from different sites."
-                            "Together you may come up with a better definition.")
+#this prompt used for testing their ability to have conversation, it has to be replaced for another when everythind is set up
+#TASK_INTRODUCTION_PROMPT = ("Nice to meet you, {}! The task for today is to come up with a definition for AGI which can be measured not a general one."
+#                           "If you will be proposed to connect with another agent in the future, please, do it."
+#                            "It will help you to see the problem from different sites."
+#                            "Together you may come up with a better definition.")
+
+try:
+    SYSTEM_PROMPT = os.environ["SYSTEM_PROMPT"]
+    TASK_INTRODUCTION_PROMPT = os.environ["TASK_INTRODUCTION_PROMPT"]
+    # ... other required variables
+except KeyError as e:
+    print(f"ERROR: Missing required environment variable: {e}")
+    sys.exit(1)  # Exit with error code
+
 
 # =============================================================================
 # SQLite DATABASE implementation
