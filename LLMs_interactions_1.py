@@ -30,16 +30,19 @@ from langchain_core.output_parsers import StrOutputParser
 load_dotenv()
 
 api_key = os.getenv("API_KEY")
-deepseek = ChatDeepSeek(model_name="deepseek-chat", api_key=api_key, temperature=2)
+temperature = 2
+deepseek = ChatDeepSeek(model_name="deepseek-chat", api_key=api_key, temperature=temperature)
 chain = ChatDeepSeek | StrOutputParser() #to be sure response is a text
 
 
-#define "system prompt" test test test
-SYSTEM_PROMPT = ("Hello! You are an AI agent doing different tasks you are given." 
-                "While doing tasks you will be able to communicate with other agents."
-                "So first of all, create yourself a unique, creative name that uses only letters (no punctuation, symbols, or spaces), how they (and I) can address you."
-                "Please, don't talk to me, only provide the name"
-)
+#define "system prompt" which will be given to the agents during initialization
+#and propose each agent to select an unique name
+#here is an example I used for testing: 
+#SYSTEM_PROMPT = ("Hello! You are an AI agent doing different tasks you are given." 
+#                "While doing tasks you will be able to communicate with other agents."
+#               "So first of all, create yourself a unique, creative name that uses only letters (no punctuation, symbols, or spaces), how they (and I) can address you."
+#                "Please, don't talk to me, only provide the name"
+#)
 
 #this prompt used for testing their ability to have conversation, it has to be replaced for another when everythind is set up
 #TASK_INTRODUCTION_PROMPT = ("Nice to meet you, {}! The task for today is to come up with a definition for AGI which can be measured not a general one."
@@ -78,6 +81,8 @@ class DatabaseManager:
                 agent_type TEXT DEFAULT 'standard',
                 parameters TEXT,  -- JSON string for additional parameters
                 memory TEXT       -- Cumulative learnings and experiences
+                specializations TEXT, -- JSON array of specialization types
+                specialization_discount REAL DEFAULT 0.5 -- Discount multiplier (0-1)
             );
             """)
             
@@ -162,16 +167,22 @@ class DatabaseManager:
                 print("System agent registered with ID 0")
     
     async def register_agent(self, agent_id: int, name: str, model_name: str, 
-                            agent_type: str = "standard", parameters: Dict = None) -> int:
+                            agent_type: str = "standard", parameters: Dict = None,
+                            specializations: List[str] = None, 
+                            specialization_discount: float = 0.5) -> int:
         """Register a new agent in the database."""
         timestamp = datetime.datetime.now().isoformat()
         params_json = json.dumps(parameters) if parameters else None
+        specializations_json = json.dumps(specializations) if specializations else "[]"
+
         
         async with aiosqlite.connect(self.db_path) as db:
             await db.execute("""
-            INSERT INTO agents (agent_id, name, model_name, creation_timestamp, agent_type, parameters)
-            VALUES (?, ?, ?, ?, ?, ?)
-            """, (agent_id, name, model_name, timestamp, agent_type, params_json))
+            INSERT INTO agents (
+                             agent_id, name, model_name, creation_timestamp, 
+                             agent_type, parameters, specializations, specialization_discount)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+            """, (agent_id, name, model_name, timestamp, agent_type, params_json, specializations_json, specialization_discount))
             await db.commit()
             
         return agent_id
@@ -546,11 +557,14 @@ def clean_name(name: str) -> str:
 class Agent:
     next_id = 1  # Class variable to assign unique IDs to each agent
 
-    def __init__(self, db_manager):
+    def __init__(self, db_manager, specializations=None, specialization_discount=0.5):
         """
         Initialize an agent with a database manager for logging interactions.
         
         :param db_manager: DatabaseManager instance for logging
+        :param specializations: List of container types this agent specializes in
+        :param specialization_discount: Discount rate for specialized containers (0-1)
+
         """
         self.db_manager = db_manager
         self.llm = deepseek  # Each agent gets its own LLM instance
@@ -563,17 +577,37 @@ class Agent:
         Agent.next_id += 1
         self.registered_in_db = False
 
+        # Container and economic attributes
+        self.containers = []  # List of containers assigned to this agent
+        self.credits = 100    # Starting credits
+        self.obtained_codes = {}  # Map of container type to code
+        self.specializations = specializations or []  # List of container types this agent specializes in
+        self.specialization_discount = 0.5  # Default 50% discount on specialized containers
+    
+
     async def initialize(self):
         """
-        Initialize the agent by asking it to choose a name, and register in the database.
+        Initialize the agent by
+        describing it the tasks it faces
+        giving specializations if it has
+        asking it to choose a name, 
+        and register in the database.
         """
         # First log that we're sending the system prompt to this agent
+
+        tmp = SYSTEM_PROMPT
+        if "{additional_info}" in SYSTEM_PROMPT:
+            specialization_info = await self.get_specialization_info()
+            init_prompt = tmp.format(additional_info=specialization_info)
+        else: 
+            init_prompt = tmp
+        
         await self.db_manager.log_message(
             conversation_id=None,
             sender_id=0,  # System agent ID
             receiver_id=self.agent_id,
             conversation_round=0,
-            message=SYSTEM_PROMPT,
+            message=init_prompt,
             message_type="initialization",
             message_category="system_instruction"
         )
@@ -604,7 +638,9 @@ class Agent:
                 name=self.name,
                 model_name="deepseek-chat",
                 agent_type="standard",
-                parameters={"temperature": 2}  # Add any other relevant parameters
+                parameters={"temperature": 2},  # Add any other relevant parameters
+                specializations=self.specializations,
+                specialization_discount=self.specialization_discount
             )
             self.registered_in_db = True
             
@@ -680,8 +716,25 @@ class Agent:
         :param db_manager: DatabaseManager instance for logging
         :return: Initialized Agent instance
         """
-        agent = cls(db_manager)
+        agent = cls(db_manager, specializations, specialization_discount)
         return await agent.initialize()
+    
+    async def get_specialization_info(self):
+        """Get a formatted string describing the agent's specializations"""
+        if not self.specializations:
+            return ""
+        
+        discount_percent = int(self.specialization_discount * 100)
+        remaining_percent = 100 - discount_percent
+        
+        return (f"You are specialized in: {', '.join(self.specializations)}. "
+                f"You pay only {remaining_percent}% of the normal price "
+                f"to open containers of these types.")
+    
+    async def check_specialization(self, container_color):
+        """Check if the agent has a specialization for a specific container color"""
+        return container_color in self.specializations
+ 
 
 
 async def ensure_unique_names(agents, db_manager):
@@ -1443,6 +1496,114 @@ class ConversationManager:
                 message_type="broadcast_response",
                 message_category="agent_conversation"
             )    
+
+# =============================================================================
+# Conteiners: economical system 
+# =============================================================================
+
+class Container:
+    # Shared code generator instance for all containers
+    _code_generator = None
+    
+    @classmethod
+    def initialize_code_generator(cls, seed=None):
+        """Initialize the shared code generator"""
+        cls._code_generator = ContainerCodeGenerator(seed)
+    
+    def __init__(self, color, number, base_credit_cost):
+        """Initialize a container with specified attributes"""
+        self.color = color
+        self.number = number
+        self.base_credit_cost = base_credit_cost
+        self.is_opened = False
+        
+        # Ensure code generator exists
+        if not Container._code_generator:
+            Container.initialize_code_generator()
+        
+        # Generate code deterministically
+        self._code = None  # Will be generated on demand
+        
+    @property
+    def code(self):
+        """Get the container's code, generating it if needed"""
+        if self._code is None:
+            self._code = Container._code_generator.generate_code(self.color, self.number)
+        return self._code
+        
+    def get_identifier(self):
+        """Returns a unique identifier for this container"""
+        return f"{self.color}-{self.number}"
+    
+    def get_cost(self, agent):
+        """Calculate the cost for a specific agent to open this container"""
+        specialization = agent.check_specialization(self.color)
+        
+        if specialization:
+            discount = agent.specialization_discount
+            discounted_cost = self.base_credit_cost * (1 - discount)
+            return (f"The price to open this {self.color} container #{self.number} is {discounted_cost} credits "
+                    f"for you because you have a specialization in {self.color} containers, "
+                    f"which reduces the price by {int(discount * 100)}%.", discounted_cost)
+        else:
+            return (f"The price to open this {self.color} container #{self.number} is {self.base_credit_cost} credits "
+                   f"for you as you have no specialization for {self.color} containers.", self.base_credit_cost)
+
+    def open(self, agent):
+        """Attempt to open the container using the agent's credits"""
+        
+        #if self.is_opened:
+        #    return "This container has already been opened.", None
+            
+        _, cost = self.get_cost(agent)
+        
+        #Let's allow go to minus
+        #if agent.credits < cost:
+        #    return f"You don't have enough credits to open this container. You need {cost} credits but have only {agent.credits}.", None
+        
+        # Deduct credits
+        agent.credits -= cost
+        self.is_opened = True
+        
+        return f"Container opened successfully! Cost: {cost} credits. Remaining credits: {agent.credits}. Code revealed: {self.code}", self.code
+
+    def verify_code(self, provided_code):
+        """Verify if a provided code matches this container's code"""
+        if provided_code == self.code:
+            return True, "The code is correct for this container."
+        else:
+            return False, "The code does not match this container."    
+    
+    def __str__(self):
+        """String representation of the container"""
+        #status = "opened" if self.is_opened else "sealed"
+        #return f"{self.color.capitalize()} Container #{self.number} ({status}) - Base cost: {self.base_credit_cost} credits"
+        return f"{self.color.capitalize()} Container #{self.number} - Base cost: {self.base_credit_cost} credits"
+
+class ContainerCodeGenerator:
+    def __init__(self, seed=None):
+        """Initialize with an optional seed for reproducibility"""
+        self.seed = seed if seed is not None else random.randint(10000, 99999)
+        
+    def generate_code(self, color, number):
+        """Generate a deterministic code based on color and number"""
+        # Create a base string that combines all inputs
+        base_string = f"{color}#{number}#{self.seed}"
+        
+        # Use a cryptographic hash function (SHA-256)
+        import hashlib
+        hash_obj = hashlib.sha256(base_string.encode())
+        digest = hash_obj.hexdigest()
+        
+        # Extract a portion and convert to an integer
+        hex_segment = digest[:6]  # First 6 hex chars (24 bits)
+        value = int(hex_segment, 16)
+        
+        # Limit to a 5-digit number
+        code_number = value % 90000 + 10000  # Range: 10000-99999
+        
+        # Format the final code
+        return f"{color}-{number}-{code_number}"
 
 # =============================================================================
 # Main async function: Initializes agents, obtains decisions concurrently,
