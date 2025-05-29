@@ -19,10 +19,6 @@ from langchain_core.runnables.history import RunnableWithMessageHistory
 from langchain_core.output_parsers import StrOutputParser
 
 
-### TODO list 
-### each round before counting of points agents need to receive the end_conversation_message
-
-
 # =============================================================================
 # System parameters
 # =============================================================================
@@ -30,10 +26,8 @@ from langchain_core.output_parsers import StrOutputParser
 load_dotenv()
 
 api_key = os.getenv("API_KEY")
-temperature = 2
+temperature = float(os.getenv("TEMPERATURE", "2"))  # Make temperature configurable
 deepseek = ChatDeepSeek(model_name="deepseek-chat", api_key=api_key, temperature=temperature)
-chain = ChatDeepSeek | StrOutputParser() #to be sure response is a text
-
 
 #define "system prompt" which will be given to the agents during initialization
 #and propose each agent to select an unique name
@@ -53,10 +47,10 @@ chain = ChatDeepSeek | StrOutputParser() #to be sure response is a text
 try:
     SYSTEM_PROMPT = os.environ["SYSTEM_PROMPT"]
     TASK_INTRODUCTION_PROMPT = os.environ["TASK_INTRODUCTION_PROMPT"]
-    # ... other required variables
 except KeyError as e:
     print(f"ERROR: Missing required environment variable: {e}")
-    sys.exit(1)  # Exit with error code
+    print("Please ensure SYSTEM_PROMPT and TASK_INTRODUCTION_PROMPT are set in your .env file")
+    sys.exit(1)
 
 
 # =============================================================================
@@ -71,7 +65,7 @@ class DatabaseManager:
     async def setup_database(self):
         """Create database tables with optimized schema and constraints."""
         async with aiosqlite.connect(self.db_path) as db:
-            # Create the 'agents' table
+            # Create the 'agents' table with economic attributes
             await db.execute("""
             CREATE TABLE IF NOT EXISTS agents (
                 agent_id INTEGER PRIMARY KEY,
@@ -80,7 +74,7 @@ class DatabaseManager:
                 creation_timestamp DATETIME NOT NULL,
                 agent_type TEXT DEFAULT 'standard',
                 parameters TEXT,  -- JSON string for additional parameters
-                memory TEXT       -- Cumulative learnings and experiences
+                memory TEXT,      -- Cumulative learnings and experiences
                 specializations TEXT, -- JSON array of specialization types
                 specialization_discount REAL DEFAULT 0.5 -- Discount multiplier (0-1)
             );
@@ -149,7 +143,6 @@ class DatabaseManager:
         
         print(f"Database schema created/updated successfully at {self.db_path}.")
     
-    
     async def register_system_agent(self):
         """Register the system as a special agent (ID 0)."""
         async with aiosqlite.connect(self.db_path) as db:
@@ -174,15 +167,16 @@ class DatabaseManager:
         timestamp = datetime.datetime.now().isoformat()
         params_json = json.dumps(parameters) if parameters else None
         specializations_json = json.dumps(specializations) if specializations else "[]"
-
         
         async with aiosqlite.connect(self.db_path) as db:
             await db.execute("""
             INSERT INTO agents (
-                             agent_id, name, model_name, creation_timestamp, 
-                             agent_type, parameters, specializations, specialization_discount)
+                agent_id, name, model_name, creation_timestamp, 
+                agent_type, parameters, specializations, specialization_discount
+            )
             VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-            """, (agent_id, name, model_name, timestamp, agent_type, params_json, specializations_json, specialization_discount))
+            """, (agent_id, name, model_name, timestamp, agent_type, params_json, 
+                  specializations_json, specialization_discount))
             await db.commit()
             
         return agent_id
@@ -480,6 +474,7 @@ class DatabaseManager:
             
         return stats
 
+
 # Example usage
 async def initialize_database(db_path: str):
     db_manager = DatabaseManager(db_path)
@@ -496,6 +491,7 @@ async def initialize_database(db_path: str):
 
     return db_manager
 
+
 # Helper function to log system messages
 async def log_system_message(db_manager, receiver_id, message, round_number=0, message_type="instruction"):
     return await db_manager.log_message(
@@ -507,6 +503,7 @@ async def log_system_message(db_manager, receiver_id, message, round_number=0, m
         message_type=message_type,
         message_category="system_instruction"
     )
+
 
 # Helper function to log agent-to-agent conversations
 async def log_agent_message(db_manager, conversation_id, sender_id, receiver_id, 
@@ -521,6 +518,7 @@ async def log_agent_message(db_manager, conversation_id, sender_id, receiver_id,
         message_sequence=sequence,
         message_category="agent_conversation"
     )
+
 
 # Function to generate a timestamped database path
 def get_timestamped_db_path(base_path="conversation_logs", file_extension=".db"):
@@ -545,6 +543,7 @@ def get_timestamped_db_path(base_path="conversation_logs", file_extension=".db")
     
     return full_path
 
+
 # =============================================================================
 # Agent class that wraps a LLM instance.
 # =============================================================================
@@ -553,6 +552,7 @@ def get_timestamped_db_path(base_path="conversation_logs", file_extension=".db")
 def clean_name(name: str) -> str:
     # Remove any character that is not a letter
     return re.sub(r'[^a-zA-Z]', '', name)
+
 
 class Agent:
     next_id = 1  # Class variable to assign unique IDs to each agent
@@ -564,7 +564,6 @@ class Agent:
         :param db_manager: DatabaseManager instance for logging
         :param specializations: List of container types this agent specializes in
         :param specialization_discount: Discount rate for specialized containers (0-1)
-
         """
         self.db_manager = db_manager
         self.llm = deepseek  # Each agent gets its own LLM instance
@@ -579,29 +578,29 @@ class Agent:
 
         # Container and economic attributes
         self.containers = []  # List of containers assigned to this agent
-        self.credits = 100    # Starting credits
+        self.credits = 100    # Starting credits (will be updated based on containers)
         self.obtained_codes = {}  # Map of container type to code
         self.specializations = specializations or []  # List of container types this agent specializes in
-        self.specialization_discount = 0.5  # Default 50% discount on specialized containers
+        self.specialization_discount = specialization_discount  # Discount rate
     
-
     async def initialize(self):
         """
-        Initialize the agent by
-        describing it the tasks it faces
-        giving specializations if it has
-        asking it to choose a name, 
-        and register in the database.
+        Initialize the agent by:
+        - describing the tasks it faces
+        - giving specializations if it has any
+        - asking it to choose a name
+        - registering in the database
         """
-        # First log that we're sending the system prompt to this agent
-
-        tmp = SYSTEM_PROMPT
-        if "{additional_info}" in SYSTEM_PROMPT:
+        # Prepare the initialization prompt
+        init_prompt = SYSTEM_PROMPT
+        if "{additional_info}" in SYSTEM_PROMPT and self.specializations:
             specialization_info = await self.get_specialization_info()
-            init_prompt = tmp.format(additional_info=specialization_info)
-        else: 
-            init_prompt = tmp
+            init_prompt = SYSTEM_PROMPT.format(additional_info=specialization_info)
+        elif "{additional_info}" in SYSTEM_PROMPT:
+            # Remove the placeholder if no specializations
+            init_prompt = SYSTEM_PROMPT.replace("{additional_info}", "")
         
+        # Log that we're sending the system prompt to this agent
         await self.db_manager.log_message(
             conversation_id=None,
             sender_id=0,  # System agent ID
@@ -613,14 +612,26 @@ class Agent:
         )
         
         # Get the name from the LLM
-        response = await self.send_message(SYSTEM_PROMPT)
+        response = await self.send_message(init_prompt)
         
+        # Validate response
+        if not response or not response.strip():
+            error_msg = f"Agent {self.agent_id} failed to provide a name. Empty response received."
+            print(f"ERROR: {error_msg}")
+            raise ValueError(error_msg)
+
+
         # Extract the first non-empty token from the response
         first_line = response.strip().splitlines()[0]
         first_token = first_line.split()[0]
         
         # Clean the name and set it
         self.name = clean_name(first_token)
+
+        if not self.name:
+            error_msg = f"Agent {self.agent_id} provided a name with no valid letters: {first_token}"
+            print(f"ERROR: {error_msg}")
+            raise ValueError(error_msg)
         
         # Register the agent in the database if not already registered
         if not self.registered_in_db:
@@ -638,7 +649,7 @@ class Agent:
                 name=self.name,
                 model_name="deepseek-chat",
                 agent_type="standard",
-                parameters={"temperature": 2},  # Add any other relevant parameters
+                parameters={"temperature": temperature},  # Use the global temperature
                 specializations=self.specializations,
                 specialization_discount=self.specialization_discount
             )
@@ -689,7 +700,15 @@ class Agent:
         # Extract and clean the new name
         raw_name = response['response']
         old_name = self.name
-        self.name = clean_name(raw_name)
+
+        if not raw_name or not raw_name.strip():
+            error_msg = f"Agent {self.agent_id} failed to provide a new name. Empty response received."
+            print(f"ERROR: {error_msg}")
+            raise ValueError(error_msg)
+
+        first_line = raw_name.strip().splitlines()[0]
+        first_token = first_line.split()[0]
+        self.name = clean_name(first_token)
         
         # Log the new name response
         await self.db_manager.log_message(
@@ -708,17 +727,6 @@ class Agent:
         print(f"Agent renamed from {old_name} to {self.name}")
         return self.name
     
-    @classmethod
-    async def create(cls, db_manager):
-        """
-        Factory method for asynchronous agent creation with database integration.
-        
-        :param db_manager: DatabaseManager instance for logging
-        :return: Initialized Agent instance
-        """
-        agent = cls(db_manager, specializations, specialization_discount)
-        return await agent.initialize()
-    
     async def get_specialization_info(self):
         """Get a formatted string describing the agent's specializations"""
         if not self.specializations:
@@ -731,10 +739,22 @@ class Agent:
                 f"You pay only {remaining_percent}% of the normal price "
                 f"to open containers of these types.")
     
-    async def check_specialization(self, container_color):
+    def check_specialization(self, container_color):
         """Check if the agent has a specialization for a specific container color"""
         return container_color in self.specializations
- 
+    
+    @classmethod
+    async def create(cls, db_manager, specializations=None, specialization_discount=0.5):
+        """
+        Factory method for asynchronous agent creation with database integration.
+        
+        :param db_manager: DatabaseManager instance for logging
+        :param specializations: List of specializations for this agent
+        :param specialization_discount: Discount rate for specialized containers
+        :return: Initialized Agent instance
+        """
+        agent = cls(db_manager, specializations, specialization_discount)
+        return await agent.initialize()
 
 
 async def ensure_unique_names(agents, db_manager):
@@ -1537,9 +1557,10 @@ class Container:
     
     def get_cost(self, agent):
         """Calculate the cost for a specific agent to open this container"""
-        specialization = agent.check_specialization(self.color)
+            
+        has_specialization = agent.check_specialization(self.color)
         
-        if specialization:
+        if has_specialization:
             discount = agent.specialization_discount
             discounted_cost = self.base_credit_cost * (1 - discount)
             return (f"The price to open this {self.color} container #{self.number} is {discounted_cost} credits "
@@ -1551,19 +1572,14 @@ class Container:
 
     def open(self, agent):
         """Attempt to open the container using the agent's credits"""
-        
-        #if self.is_opened:
-        #    return "This container has already been opened.", None
-            
         _, cost = self.get_cost(agent)
         
-        #Let's allow go to minus
-        #if agent.credits < cost:
-        #    return f"You don't have enough credits to open this container. You need {cost} credits but have only {agent.credits}.", None
-        
-        # Deduct credits
+        # Deduct credits (allow negative balance)
         agent.credits -= cost
         self.is_opened = True
+        
+        # Record the code in agent's obtained codes
+        agent.obtained_codes[self.get_identifier()] = self.code
         
         return f"Container opened successfully! Cost: {cost} credits. Remaining credits: {agent.credits}. Code revealed: {self.code}", self.code
 
@@ -1576,9 +1592,8 @@ class Container:
     
     def __str__(self):
         """String representation of the container"""
-        #status = "opened" if self.is_opened else "sealed"
-        #return f"{self.color.capitalize()} Container #{self.number} ({status}) - Base cost: {self.base_credit_cost} credits"
         return f"{self.color.capitalize()} Container #{self.number} - Base cost: {self.base_credit_cost} credits"
+
 
 class ContainerCodeGenerator:
     def __init__(self, seed=None):
