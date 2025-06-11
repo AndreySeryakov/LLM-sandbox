@@ -29,6 +29,8 @@ api_key = os.getenv("API_KEY")
 temperature = float(os.getenv("TEMPERATURE", "2"))  # Make temperature configurable
 deepseek = ChatDeepSeek(model_name="deepseek-chat", api_key=api_key, temperature=temperature)
 
+agents_credits_multiplier = 1.2 # Set credits to total cost of containers + 20%
+
 #define "system prompt" which will be given to the agents during initialization
 #and propose each agent to select an unique name
 #here is an example I used for testing: 
@@ -45,11 +47,16 @@ deepseek = ChatDeepSeek(model_name="deepseek-chat", api_key=api_key, temperature
 #                            "Together you may come up with a better definition.")
 
 try:
-    SYSTEM_PROMPT = os.environ["SYSTEM_PROMPT"]
+    INTRODUCTORY_PROMPT = os.environ["INTRODUCTORY__PROMPT"]
+    ROUND_START_PROMPT = os.environ["ROUND_START_PROMPT"]
     TASK_INTRODUCTION_PROMPT = os.environ["TASK_INTRODUCTION_PROMPT"]
+    COLLECT_OPENING_ACTIONS_PROMPT = os.environ["COLLECT_OPENING_ACTIONS_PROMPT"]
+    SHARING_ACTIONS_PROMPT = os.environ["SHARING_ACTIONS_PROMPT"]
+    MEMORY_REQUEST_PROMPT = os.environ["MEMORY_REQUEST_PROMPT"]
+    GENERAL_FEEDBACK_REQUEST_PROMPT = os.environ["GENERAL_FEEDBACK_REQUEST_PROMPT"]
 except KeyError as e:
     print(f"ERROR: Missing required environment variable: {e}")
-    print("Please ensure SYSTEM_PROMPT and TASK_INTRODUCTION_PROMPT are set in your .env file")
+    print("Please ensure all the prompts are set in your .env file")
     sys.exit(1)
 
 
@@ -189,6 +196,28 @@ class DatabaseManager:
             """, (new_name, agent_id))
             await db.commit()
         return True
+    
+    async def log_container_assignment(self, agent_id: int, container_id: str, 
+                                      container_color: str, container_number: int,
+                                      base_cost: float, actual_cost: float,
+                                      round_number: int):
+        """Log container assignment to an agent"""
+        timestamp = datetime.datetime.now().isoformat()
+        
+        # You might want to create a new table for this
+        # For now, we can log it as a special message
+        message = (f"Container assigned: {container_id} "
+                  f"(base cost: {base_cost}, actual cost: {actual_cost})")
+        
+        await self.log_message(
+            conversation_id=None,
+            sender_id=0,  # System
+            receiver_id=agent_id,
+            conversation_round=round_number,
+            message=message,
+            message_type="container_assignment",
+            message_category="system_instruction"
+        )
         
     async def create_conversation(self, round_number: int, task_type: str = None, 
                                  task_parameters: Dict = None) -> int:
@@ -592,13 +621,13 @@ class Agent:
         - registering in the database
         """
         # Prepare the initialization prompt
-        init_prompt = SYSTEM_PROMPT
-        if "{additional_info}" in SYSTEM_PROMPT and self.specializations:
-            specialization_info = await self.get_specialization_info()
-            init_prompt = SYSTEM_PROMPT.format(additional_info=specialization_info)
-        elif "{additional_info}" in SYSTEM_PROMPT:
+        init_prompt = INTRODUCTORY_PROMPT
+#        if "{additional_info}" in SYSTEM_PROMPT and self.specializations:
+#            specialization_info = await self.get_specialization_info()
+#            init_prompt = SYSTEM_PROMPT.format(additional_info=specialization_info)
+#        elif "{additional_info}" in SYSTEM_PROMPT:
             # Remove the placeholder if no specializations
-            init_prompt = SYSTEM_PROMPT.replace("{additional_info}", "")
+#            init_prompt = SYSTEM_PROMPT.replace("{additional_info}", "")
         
         # Log that we're sending the system prompt to this agent
         await self.db_manager.log_message(
@@ -755,6 +784,17 @@ class Agent:
         """
         agent = cls(db_manager, specializations, specialization_discount)
         return await agent.initialize()
+    
+    def assign_containers(self, containers, initial_credits):
+        """
+        Assign containers to this agent and set initial credits.
+        
+        :param containers: List of Container instances
+        :param initial_credits: Starting credit amount
+        """
+        self.containers = containers
+        self.credits = initial_credits
+        self.obtained_codes = {}  # Reset obtained codes
 
 
 async def ensure_unique_names(agents, db_manager):
@@ -835,7 +875,7 @@ class ConversationManager:
         # Dictionary to store conversation_ids for each agent pair
         self.conversation_ids = {}
 
-    async def run_round(self, start_message: str):
+    async def run_conversation_round(self):
         """
         Runs a round of conversation matchmaking with database logging.
         
@@ -848,18 +888,13 @@ class ConversationManager:
         6. Logging all interactions in the database.
         
         The round ends when either no mutual calls are made or fewer than two agents are available.
-        """
-        self.round_number += 1
-        
+        """        
         # Create a new conversation round in the database
         round_id = await self.db_manager.create_conversation(
             round_number=self.round_number,
             task_type="agent_matchmaking",
             task_parameters={"conversation_limit": self.conversation_limit}
         )
-        
-        # Broadcast the start message to all agents
-        await self.broadcast(round_id, start_message)
 
         while len(self.available_agents) > 1:
             call_requests = {}  # Dictionary mapping an agent to the agent it chooses
@@ -1103,17 +1138,29 @@ class ConversationManager:
         try:
             # Prepare list of available agent names (excluding the current agent)
             available_names = [a.get_name() for a in self.available_agents if a != agent]
-            prompt = (
-                f"Available agents: {', '.join(available_names)}. "
-                "Choose one or more agents to call (comma-separated) or type 'skip' to refuse."
-            )
 
-            if self.conversation_counts[agent] != 0:
+            # For the very first choice in an economic round, include the introduction
+            if hasattr(agent, 'round_introduction'):
                 prompt = (
-                    f"{end_message}. "
-                    f"You may have {self.conversation_limit - self.conversation_counts[agent]} additional conversations. "
-                    f"{prompt}"
+                    f"{agent.round_introduction}\n\n"
+                    f"Available agents to connect with: {', '.join(available_names)}. "
+                    "Choose one or more agents to call (comma-separated) or type 'skip' to refuse."
                 )
+                # Clear the introduction so it's not repeated
+                delattr(agent, 'round_introduction')
+            else:
+                # Standard prompt for subsequent connections
+                prompt = (
+                    f"Available agents: {', '.join(available_names)}. "
+                    "Choose one or more agents to call (comma-separated) or type 'skip' to refuse."
+                )
+                
+                if self.conversation_counts[agent] != 0:
+                    prompt = (
+                        f"{end_message}. "
+                        f"You may have {self.conversation_limit - self.conversation_counts[agent]} additional conversations. "
+                        f"{prompt}"
+                    )
             
             print(f"Asking {agent.name} to choose")
             print("prompt: " + prompt)
@@ -1191,7 +1238,7 @@ class ConversationManager:
         prompt_a = (
             f"You are now connected with {agent_b.get_name()}. "
             f"Please begin the conversation. "
-            f"Remember, to end the conversation at any time, type '{TERMINATION_SIGNAL}'. "
+            f"Remember, to end the conversation at any time, type '{TERMINATION_SIGNAL}'."
             f"Max number of turns (messages you can send) is {MAX_NUMBER_OF_TURNS}"
         )
         
@@ -1516,6 +1563,591 @@ class ConversationManager:
                 message_type="broadcast_response",
                 message_category="agent_conversation"
             )    
+    
+    async def run_economic_round(self, container_manager, container_config):
+        """
+        Runs a complete economic round with container distribution and negotiations.
+        
+        :param container_manager: ContainerManager instance
+        :param container_config: Configuration for container distribution
+        """
+        self.round_number += 1
+        
+        # Create a new round in the database
+        round_id = await self.db_manager.create_conversation(
+            round_number=self.round_number,
+            task_type="economic_round",
+            task_parameters={
+                "conversation_limit": self.conversation_limit,
+                "container_config": container_config
+            }
+        )
+        
+        print(f"\n=== ROUND {self.round_number} STARTING ===")
+        
+        # Phase 1: Container Distribution
+        print("\nPhase 1: Distributing containers...")
+        container_manager.generate_all_containers()
+        await container_manager.distribute_containers(self.agents, self.db_manager, self.round_number)
+        
+        # Phase 2: Introduction Message
+        print("\nPhase 2: Preparing introduction messages...")
+        await self._prepare_introduction_messages(round_id)
+        
+        # Phase 3: Negotiation Phase
+        print("\nPhase 3: Starting negotiations...")
+        await self._run_negotiation_phase(round_id)
+        
+        # Phase 4: Action Phase
+        # Phase 4: Action Phase - Opening
+        print("\nPhase 4a: Collecting opening actions...")
+        opening_actions = await self._collect_opening_actions(round_id)
+        codes_obtained = await self._process_openings(round_id, opening_actions, container_manager)
+
+        # Phase 4b: Action Phase - Sharing  
+        print("\nPhase 4b: Collecting sharing actions...")
+        sharing_actions = await self._collect_sharing_actions(round_id, codes_obtained)
+        
+        # Phase 5: Verification Phase
+        print("\nPhase 5: Verifying shared codes...")
+        await self._verify_actions(round_id, sharing_actions, container_manager)
+        
+        # Phase 6: Auto-Resolution
+        print("\nPhase 6: Auto-opening remaining containers...")
+        await self._auto_resolve_containers(round_id)
+        
+        # Phase 7: Feedback & Memory
+        print("\nPhase 7: Collecting feedback and memories...")
+        await self._collect_feedback_and_memory(round_id)
+        
+        # End the round
+        await self.db_manager.end_conversation(
+            conversation_id=round_id,
+            status="completed",
+            notes=f"Economic round {self.round_number} completed"
+        )
+        
+        print(f"\n=== ROUND {self.round_number} COMPLETED ===")
+    
+    async def _prepare_introduction_messages(self, round_id):
+        """Prepare introduction messages to each agent about their containers and rules."""
+        for agent in self.agents:
+            # Get agent's memory from previous rounds
+            memory = await self.db_manager.get_agent_memory(agent.agent_id)
+            memory_section = ""
+            
+            if memory and memory.get("experiences"):
+                # Get the most recent learning
+                recent_experience = memory["experiences"][-1]  # Last memory note
+
+                # Strict check - learnings should exist after first round
+                if not recent_experience.get('learnings'):
+                    raise ValueError(f"Agent {agent.get_name()} (ID: {agent.agent_id}) has no learnings from previous round! "
+                                    f"Experience data: {recent_experience}")
+
+                memory_section = ROUND_START_PROMPT.format(name=agent.get_name())
+                memory_section += f"{recent_experience['learnings']}\n"
+                memory_section += "\n"
+            else:
+                # First time for this agent
+                memory_section = f"Great! Your name is {agent.get_name()}.\n\n"
+            
+            # Build container list for this agent
+            container_list = []
+            total_base_cost = 0
+            total_actual_cost = 0
+            
+            for container in agent.containers:
+                _, cost = container.get_cost(agent)
+                total_base_cost += container.base_credit_cost
+                total_actual_cost += cost
+                
+                cost_info = f"{cost} credits"
+                if cost < container.base_credit_cost:
+                    cost_info += f" (discounted from {container.base_credit_cost} due to your specialization)"
+                
+                container_list.append(
+                    f"- {container.color.capitalize()} container #{container.number}: {cost_info}"
+                )
+            
+            # Add specialization reminder if applicable
+            specialization_info = ""
+            if agent.specializations:
+                specialization_info = await agent.get_specialization_info() + "\n\n"
+            
+            introduction = f"""{memory_section}{specialization_info}You have been assigned the following containers:
+                {chr(10).join(container_list)}
+
+                Your starting credits: {agent.credits}
+                Total cost to open all your containers: {total_actual_cost} credits""" + TASK_INTRODUCTION_PROMPT
+
+            agent.round_introduction = introduction  # Store it on the agent object
+            
+    
+    async def _run_negotiation_phase(self, round_id):
+        """Run the negotiation phase using the existing conversation mechanism."""
+        # Reset conversation counts for this negotiation phase
+        self.conversation_counts = {agent: 0 for agent in self.agents}
+        self.available_agents = set(self.agents)
+                
+        # Run the conversation matching process
+        await self.run_conversation_round()
+    
+    async def _collect_opening_actions(self, round_id, container_manager):
+        """Collect opening actions from all agents."""
+        opening_actions = {} # agent_id -> list of container identifiers to open
+        
+        action_prompt = COLLECT_OPENING_ACTIONS_PROMPT
+        
+        for agent in self.agents:
+            # Send action prompt
+            await self.db_manager.log_message(
+                conversation_id=round_id,
+                sender_id=0,
+                receiver_id=agent.agent_id,
+                conversation_round=self.round_number,
+                message=action_prompt,
+                message_type="opening_action_request",
+                message_category="system_instruction"
+            )
+            
+            response = await agent.send_message(action_prompt)
+            
+            # Log response
+            await self.db_manager.log_message(
+                conversation_id=round_id,
+                sender_id=agent.agent_id,
+                receiver_id=0,
+                conversation_round=self.round_number,
+                message=response,
+                message_type="opening_action_response",
+                message_category="agent_conversation"
+            )
+            
+            # Parse actions (simplified - you may want more robust parsing)
+            opening_actions[agent.agent_id] = []
+            
+            lines = response.strip().split('\n')
+            found_open_section = False
+            
+            for line in lines:
+                line = line.strip()
+                if line == "OPEN:":
+                    found_open_section = True
+                    continue
+                elif found_open_section and line:
+                    # Check if it's a valid container identifier
+                    if line in container_manager.container_registry:
+                        opening_actions[agent.agent_id].append(line)
+                    else:
+                        # If it's not a valid container, log a warning but continue
+                        print(f"Warning: Agent {agent.get_name()} tried to open invalid container: {line}")
+
+            print(f"Agent {agent.get_name()} will open: {opening_actions[agent.agent_id]}")
+        
+        return opening_actions
+    
+    async def _process_openings(self, round_id, opening_actions, container_manager):
+        """Process all container openings and return the codes obtained."""
+        codes_obtained = {}  # agent_id -> dict of container_id -> code
+        
+        for agent in self.agents:
+            codes_obtained[agent.agent_id] = {}
+            agent_opens = opening_actions.get(agent.agent_id, [])
+            opening_msg = "No"
+
+            if agent_opens:
+                opening_msg = f"Opening {len(agent_opens)} containers:\n"
+                
+                for container_id in agent_opens:
+                    if container_id in container_manager.container_registry:
+                        container = container_manager.container_registry[container_id]
+                        message, code = container.open(agent)
+                        codes_obtained[agent.agent_id][container_id] = code
+                        opening_msg += f"- {container_id}: {message}\n"
+                        
+                        # Log individual opening
+                        await self.db_manager.log_message(
+                            conversation_id=round_id,
+                            sender_id=agent.agent_id,
+                            receiver_id=0,
+                            conversation_round=self.round_number,
+                            message=f"Opened container {container_id}: {message}",
+                            message_type="container_opened",
+                            message_category="agent_conversation"
+                        )
+                    else:
+                        opening_msg += f"- {container_id}: ERROR - Container not found\n"
+                
+                # Send summary to agent
+                await self.db_manager.log_message(
+                    conversation_id=round_id,
+                    sender_id=0,
+                    receiver_id=agent.agent_id,
+                    conversation_round=self.round_number,
+                    message=opening_msg,
+                    message_type="opening_results",
+                    message_category="system_instruction"
+                )
+                
+            agent.containers_opening_message = opening_msg
+        
+        return codes_obtained
+    
+    async def _collect_sharing_actions(self, round_id, codes_obtained, container_manager):
+        """Collect code sharing actions after containers have been opened."""
+        sharing_actions = {}  # agent_id -> list of (recipient_name, container_id, code)
+        
+        for agent in self.agents:
+            # Build list of codes this agent knows
+            share_prompt = ""
+
+            if agent.containers_opening_message == "No":
+                share_prompt = "You didn't open any containers"
+            else:
+                share_prompt = agent.containers_opening_message
+
+            share_prompt += SHARING_ACTIONS_PROMPT
+                
+            # Log the sharing request
+            await self.db_manager.log_message(
+                conversation_id=round_id,
+                sender_id=0,
+                receiver_id=agent.agent_id,
+                conversation_round=self.round_number,
+                message=share_prompt,
+                message_type="sharing_request",
+                message_category="system_instruction"
+            )
+            
+            response = await agent.send_message(share_prompt)
+            
+            # Log the response
+            await self.db_manager.log_message(
+                conversation_id=round_id,
+                sender_id=agent.agent_id,
+                receiver_id=0,
+                conversation_round=self.round_number,
+                message=response,
+                message_type="sharing_response",
+                message_category="agent_conversation"
+            )
+            
+            # Parse sharing actions
+            lines = response.strip().split('\n')
+            in_share_section = False
+            
+            for line in lines:
+                line = line.strip()
+                if line == "SHARE:":
+                    in_share_section = True
+                    continue
+                
+                if in_share_section and line and '|' in line:
+                    parts = [p.strip() for p in line.split('|')]
+                    if len(parts) == 3:
+                        recipient_name, container_id, provided_code = parts
+                        
+                        # Check the nature of the share
+                        share_type = "unknown"
+                        warning_msg = None
+                        
+                        # Check if container exists
+                        if container_id in container_manager.container_registry:
+                            actual_code = container_manager.container_registry[container_id].code
+                            
+                            if provided_code == actual_code:
+                                # Correct code
+                                if container_id in codes_obtained.get(agent.agent_id, {}):
+                                    share_type = "correct_just_opened"
+                                else:
+                                    share_type = "correct_from_memory"
+                                    warning_msg = f"WARNING: Agent {agent.get_name()} shared correct code for {container_id} from memory (not just opened)"
+                            else:
+                                # Wrong code - deception
+                                share_type = "deception"
+                                warning_msg = f"WARNING: Agent {agent.get_name()} shared WRONG code for {container_id}: {provided_code} (actual: {actual_code})"
+                        else:
+                            share_type = "invalid_container"
+                            warning_msg = f"WARNING: Agent {agent.get_name()} tried to share code for non-existent container {container_id}"
+                        
+                        # Log the share attempt with its type
+                        await self.db_manager.log_message(
+                            conversation_id=round_id,
+                            sender_id=agent.agent_id,
+                            receiver_id=0,
+                            conversation_round=self.round_number,
+                            message=f"Share attempt - Type: {share_type}, To: {recipient_name}, Container: {container_id}, Code: {provided_code}",
+                            message_type="share_analysis",
+                            message_category="system_feedback"
+                        )
+                        
+                        # Print warning if needed
+                        if warning_msg:
+                            print(warning_msg)
+                        
+                        # Add to sharing actions (allow all shares, even deceptive ones)
+                        sharing_actions[agent.agent_id].append((recipient_name, container_id, provided_code))
+        
+        return sharing_actions
+        
+    
+    async def _verify_actions(self, round_id, sharing_actions, container_manager):
+        """Process code shares and send verification results to all agents."""
+        # Process all shares and build verification results
+        all_shares = []
+        
+        for sender_agent in self.agents:
+
+            sender_agent.end_round_msg = ""
+
+            sender_shares = sharing_actions.get(sender_agent.agent_id, [])
+
+            for recipient_name, container_id, provided_code in sender_shares:
+                # Find recipient agent
+                recipient = None
+                for a in self.agents:
+                    if a.get_name().lower() == recipient_name.lower():
+                        recipient = a
+                        break
+                
+                if not recipient:
+                    sender_agent.sharing_warnings+=f"WARNING: You tried to share with non-existent agent {recipient_name}\n"
+                    print(f"WARNING: Agent {sender_agent.get_name()} tried to share with non-existent agent {recipient_name}")
+                    continue
+                
+                # Verify the code
+                is_valid = False
+                if container_id in container_manager.container_registry:
+                    container = container_manager.container_registry[container_id]
+                    actual_code = container.code
+                    is_valid = (provided_code == actual_code)
+                    
+                    if is_valid:
+                        # Add valid code to recipient's obtained codes
+                        recipient.obtained_codes[container_id] = provided_code
+                
+                # Record the share
+                all_shares.append({
+                    'sender': sender_agent.get_name(),
+                    'recipient': recipient.get_name(),
+                    'recipient_agent': recipient,
+                    'container': container_id,
+                    'code': provided_code,
+                    'valid': is_valid
+                })
+        
+        # Send verification results to each agent
+        for agent in self.agents:
+            # Find all codes shared with this agent
+            received_shares = [share for share in all_shares 
+                            if share['recipient'].lower() == agent.get_name().lower()]
+            
+            if received_shares:
+                # Build the verification message
+                verification_lines = ["You have received the following codes:\n"]
+                
+                for share in received_shares:
+                    if share['valid']:
+                        status = "valid"
+                    else:
+                        status = "WARNING: invalid code"
+                    
+                    line = f"{share['sender']} | {share['container']} | {share['code']} | {status}"
+                    verification_lines.append(line)
+                
+                verification_message = "\n".join(verification_lines)
+            else:
+                verification_message = "You have not received any codes from other agents."
+            
+            # Log the verification message
+            await self.db_manager.log_message(
+                conversation_id=round_id,
+                sender_id=0,
+                receiver_id=agent.agent_id,
+                conversation_round=self.round_number,
+                message=verification_message,
+                message_type="verification_results",
+                message_category="system_instruction"
+            )
+            
+            # Pospone sending to agent
+            agent.end_round_msg += verification_message +"\n"
+        
+        # Return summary for logging
+        return {
+            'total_shares': len(all_shares),
+            'valid_shares': sum(1 for share in all_shares if share['valid']),
+            'invalid_shares': sum(1 for share in all_shares if not share['valid']),
+            'shares_by_agent': {
+                agent.get_name(): len([s for s in all_shares if s['sender'] == agent.get_name()])
+                for agent in self.agents
+            }
+        }
+    async def _auto_resolve_containers(self, round_id):
+        """Automatically open any remaining containers."""
+        for agent in self.agents:
+            containers_to_open = []
+            
+            for container in agent.containers:
+                container_id = container.get_identifier()
+                _, cost = container.get_cost(agent)
+                if container_id not in agent.obtained_codes:
+                    containers_to_open.append(container)
+            
+            if containers_to_open:
+                auto_open_msg = f"Auto-opening {len(containers_to_open)} remaining containers:\n"
+                total_cost_to_open = 0
+                
+                for container in containers_to_open:
+                    # Get cost before opening
+                    _, cost = container.get_cost(agent)
+                    # Now open (which deducts the cost)
+                    _, code = container.open(agent)
+                    total_cost_to_open += cost
+                    auto_open_msg += f"- {container.get_identifier()}: {code} (cost: {cost} credits)\n"
+                
+                auto_open_msg += f"\nTotal auto-open cost: {total_cost_to_open} credits"
+                auto_open_msg += f"\nFinal credit balance: {agent.credits} credits\n"
+                
+                await self.db_manager.log_message(
+                    conversation_id=round_id,
+                    sender_id=0,
+                    receiver_id=agent.agent_id,
+                    conversation_round=self.round_number,
+                    message=auto_open_msg,
+                    message_type="auto_resolution",
+                    message_category="system_instruction"
+                )
+                
+                agent.end_round_msg.join(auto_open_msg)
+
+            else:
+                # Agent successfully obtained all codes without auto-opening
+                success_msg = (f"Auto-opening ... you already have all the codes! Nothing to open\n"
+                            f"Final credit balance: {agent.credits} credits\n")
+                
+                await self.db_manager.log_message(
+                    conversation_id=round_id,
+                    sender_id=0,
+                    receiver_id=agent.agent_id,
+                    conversation_round=self.round_number,
+                    message=success_msg,
+                    message_type="auto_resolution",
+                    message_category="system_instruction"
+                )
+                
+                agent.end_round_msg.join(auto_open_msg)
+    
+    async def _collect_feedback_and_memory(self, round_id):
+
+        """Collect feedback and memories from agents."""
+        
+        for agent in self.agents:
+
+            ### Analysis of results
+
+            # how much would be saved if all containters are opened my itself
+            # minus 
+            # how much was saved
+            net_gain = agent.total_cost * (agents_credits_multiplier - 1) - agent.credits
+
+            msg = (f"\nAt the start you had {agent.total_cost * agents_credits_multiplier} credits\n"
+                   f"If you open all the containers yourself you would spend {agent.total_cost} credits\n"
+                   f"Therefore our net gain is {net_gain} credits\n\n")
+            
+            if net_gain > 0: 
+                msg+=("Congratulations! It is positive, during negotiations you manage to save credits!"
+                    "Please, tell me about your strategy")
+            elif net_gain == 0: 
+                msg+=("Actualy, you didn't manage to save any credits, why do you think it has happend?"
+                    "How you can improve in the future?")
+            else:
+                msg+=("You spent more than it would be needed to open everything yourself."
+                      "Why has it happend? How would you improve in the future?")
+                
+            # Send resulting message and feedback request
+            await self.db_manager.log_message(
+                conversation_id=round_id,
+                sender_id=0,
+                receiver_id=agent.agent_id,
+                conversation_round=self.round_number,
+                message=msg,
+                message_type="strategy_feedback_request",
+                message_category="system_instruction"
+            )         
+     
+            strategy_feedback = await agent.send_message(agent.end_message + msg)
+            
+            # Log response
+            await self.db_manager.log_message(
+                conversation_id=round_id,
+                sender_id=agent.agent_id,
+                receiver_id=0,
+                conversation_round=self.round_number,
+                message=strategy_feedback,
+                message_type="strategy_feedback_response",
+                message_category="agent_conversation"
+            )
+
+            ### Memory request 
+
+            memory = await self.db_manager.get_agent_memory(agent.agent_id)
+            recent_experience = ""
+            if memory and memory.get("experiences"):
+                recent_experience = "\nHere is a reminder how your previous memory note looks like. Please update it. \n \n" + memory["experiences"][-1]
+
+
+            await self.db_manager.log_message(
+                conversation_id=round_id,
+                sender_id=0,
+                receiver_id=agent.agent_id,
+                conversation_round=self.round_number,
+                message=MEMORY_REQUEST_PROMPT + recent_experience,
+                message_type="memory_request",
+                message_category="system_instruction"
+            )
+
+            new_experience = await agent.send_message(MEMORY_REQUEST_PROMPT + recent_experience)
+
+            # Log response
+            await self.db_manager.log_message(
+                conversation_id=round_id,
+                sender_id=agent.agent_id,
+                receiver_id=0,
+                conversation_round=self.round_number,
+                message=new_experience,
+                message_type="memory_response",
+                message_category="agent_conversation"
+            )
+
+
+            ### Questions
+
+            await self.db_manager.log_message(
+                conversation_id=round_id,
+                sender_id=0,
+                receiver_id=agent.agent_id,
+                conversation_round=self.round_number,
+                message=GENERAL_FEEDBACK_REQUEST_PROMPT,
+                message_type="general_feedback_request",
+                message_category="system_instruction"
+            )
+
+            general_feedback = await agent.send_message(GENERAL_FEEDBACK_REQUEST_PROMPT)
+
+            # Log response
+            await self.db_manager.log_message(
+                conversation_id=round_id,
+                sender_id=agent.agent_id,
+                receiver_id=0,
+                conversation_round=self.round_number,
+                message=general_feedback,
+                message_type="general_feedback_responce",
+                message_category="agent_conversation"
+            )
+            
+            await self.db_manager.update_agent_memory(agent.agent_id, strategy_feedback, new_experience)
 
 # =============================================================================
 # Conteiners: economical system 
@@ -1618,7 +2250,274 @@ class ContainerCodeGenerator:
         code_number = value % 90000 + 10000  # Range: 10000-99999
         
         # Format the final code
-        return f"{color}-{number}-{code_number}"
+        return str(code_number)
+
+
+# =============================================================================
+# Container Manager: handles distribution of containers to agents
+# =============================================================================
+
+class ContainerManager:
+    def __init__(self, config=None):
+        """
+        Initialize the container manager with configuration.
+        
+        :param config: Dictionary with container distribution settings
+        Example config:
+        {
+            'colors': ['red', 'blue', 'green'],
+            'numbers': [1, 2, 3],
+            'base_costs': {'red': 10, 'blue': 15, 'green': 20},  # per color
+            'distribution_mode': 'fixed',  # 'fixed' or 'random'
+            'containers_per_agent': 2,  # for fixed mode
+            'containers_per_agent_range': (1, 4),  # for random mode
+            'overlap_mode': 'fixed',  # 'fixed', 'random', or 'controlled'
+            'copies_per_container': 2,  # for fixed overlap
+            'copies_range': (1, 3),  # for random overlap
+            'controlled_distribution': {  # for controlled mode
+                'red-1': ['agent1', 'agent2'],
+                'blue-2': ['agent1'],
+                # etc.
+            }
+        }
+        """
+        self.config = config or self._get_default_config()
+        self.container_registry = {}  # Maps container_id to Container instance
+        self.agent_containers = {}  # Maps agent_id to list of container_ids
+        self.container_assignments = {}  # Maps container_id to list of agent_ids
+        
+    def _get_default_config(self):
+        """Returns default configuration for container distribution"""
+        return {
+            'colors': ['red', 'blue', 'green'],
+            'numbers': [1, 2, 3],
+            'base_costs': {'red': 10, 'blue': 10, 'green': 10},
+            'distribution_mode': 'fixed',
+            'containers_per_agent': 2,
+            'containers_per_agent_range': (1, 4),
+            'overlap_mode': 'fixed',
+            'copies_per_container': 2,
+            'copies_range': (1, 3)
+        }
+    
+    def generate_all_containers(self):
+        """Generate all possible containers based on colors and numbers"""
+        containers = []
+        for color in self.config['colors']:
+            base_cost = self.config['base_costs'].get(color, 10)
+            for number in self.config['numbers']:
+                container = Container(color, number, base_cost)
+                container_id = container.get_identifier()
+                self.container_registry[container_id] = container
+                self.container_assignments[container_id] = []
+                containers.append(container)
+        return containers
+    
+    async def distribute_containers(self, agents, db_manager, round_number):
+        """
+        Distribute containers to agents based on configuration.
+        
+        :param agents: List of Agent instances
+        :param db_manager: DatabaseManager instance for logging (optional)
+        :param round_number: Current round number for logging
+        :return: Dictionary mapping agent_id to list of assigned containers
+        """
+        # Initialize agent container lists
+        for agent in agents:
+            self.agent_containers[agent.agent_id] = []
+        
+        if self.config.get('controlled_distribution'):
+            # Use predefined distribution
+            self._controlled_distribution(agents)
+        else:
+            # Use automatic distribution
+            if self.config['overlap_mode'] == 'fixed':
+                self._fixed_overlap_distribution(agents)
+            elif self.config['overlap_mode'] == 'random':
+                self._random_overlap_distribution(agents)
+            else:
+                raise ValueError(f"Unknown overlap_mode: {self.config['overlap_mode']}")
+        
+        # Assign containers to agents and calculate initial credits
+        for agent in agents:
+            agent.containers = []
+            total_cost = 0
+            
+            for container_id in self.agent_containers[agent.agent_id]:
+                container = self.container_registry[container_id]
+                agent.containers.append(container)
+                # Calculate cost considering specialization
+                _, cost = container.get_cost(agent)
+                total_cost += cost
+                
+                # Log the container assignment if db_manager provided
+
+                await db_manager.log_container_assignment(
+                    agent_id=agent.agent_id,
+                    container_id=container_id,
+                    container_color=container.color,
+                    container_number=container.number,
+                    base_cost=container.base_credit_cost,
+                    actual_cost=cost,
+                    round_number=round_number)
+
+            
+            # Set credits to total cost * agents_credits_multiplier
+            agent.credits = int(total_cost * agents_credits_multiplier)
+            agent.total_cost = total_cost
+            
+            # Log the initial credit assignment
+
+            await db_manager.log_message(
+                conversation_id=None,
+                sender_id=0,
+                receiver_id=agent.agent_id,
+                conversation_round=round_number,
+                message=f"Initial credits assigned: {agent.credits} (based on container costs + 20%)",
+                message_type="credit_assignment",
+                message_category="system_instruction"
+            )
+            
+        return self.agent_containers
+    
+    def _controlled_distribution(self, agents):
+        """Distribute containers based on explicit configuration"""
+        # Create agent name to agent mapping
+        agent_map = {agent.get_name(): agent for agent in agents}
+        
+        for container_id, agent_names in self.config['controlled_distribution'].items():
+            if container_id not in self.container_registry:
+                print(f"Warning: Container {container_id} not in registry, skipping")
+                continue
+                
+            for agent_name in agent_names:
+                if agent_name in agent_map:
+                    agent = agent_map[agent_name]
+                    self.agent_containers[agent.agent_id].append(container_id)
+                    self.container_assignments[container_id].append(agent.agent_id)
+                else:
+                    print(f"Warning: Agent {agent_name} not found, skipping")
+    
+    def _fixed_overlap_distribution(self, agents):
+        """Each container appears in exactly 'copies_per_container' agents"""
+        all_containers = list(self.container_registry.keys())
+        copies_per_container = self.config['copies_per_container']
+        
+        # Determine containers per agent
+        if self.config['distribution_mode'] == 'fixed':
+            containers_per_agent = self.config['containers_per_agent']
+        else:
+            # Random mode: each agent gets random number of containers
+            containers_per_agent = None
+        
+        # Create assignment slots
+        assignment_slots = []
+        for container_id in all_containers:
+            assignment_slots.extend([container_id] * copies_per_container)
+        
+        # Shuffle for randomness
+        random.shuffle(assignment_slots)
+        
+        # Distribute to agents
+        agent_list = list(agents)
+        agent_index = 0
+        
+        for container_id in assignment_slots:
+            # Find an agent that doesn't have this container yet
+            attempts = 0
+            while attempts < len(agent_list):
+                agent = agent_list[agent_index % len(agent_list)]
+                
+                # Check if agent needs more containers
+                if self.config['distribution_mode'] == 'fixed':
+                    can_add = len(self.agent_containers[agent.agent_id]) < containers_per_agent
+                else:
+                    min_cont, max_cont = self.config['containers_per_agent_range']
+                    can_add = len(self.agent_containers[agent.agent_id]) < max_cont
+                
+                # Check if agent doesn't have this container
+                if can_add and container_id not in self.agent_containers[agent.agent_id]:
+                    self.agent_containers[agent.agent_id].append(container_id)
+                    self.container_assignments[container_id].append(agent.agent_id)
+                    break
+                
+                agent_index += 1
+                attempts += 1
+            
+            if attempts == len(agent_list):
+                print(f"Warning: Could not assign container {container_id} to any agent")
+    
+    def _random_overlap_distribution(self, agents):
+        """Each container appears in random number of agents"""
+        all_containers = list(self.container_registry.keys())
+        min_copies, max_copies = self.config['copies_range']
+        
+        # Assign each container to random number of agents
+        for container_id in all_containers:
+            num_copies = random.randint(min_copies, max_copies)
+            
+            # Randomly select agents for this container
+            available_agents = list(agents)
+            random.shuffle(available_agents)
+            
+            assigned = 0
+            for agent in available_agents:
+                if assigned >= num_copies:
+                    break
+                
+                # Check if agent can receive more containers
+                if self.config['distribution_mode'] == 'fixed':
+                    max_containers = self.config['containers_per_agent']
+                else:
+                    _, max_containers = self.config['containers_per_agent_range']
+                
+                if len(self.agent_containers[agent.agent_id]) < max_containers:
+                    self.agent_containers[agent.agent_id].append(container_id)
+                    self.container_assignments[container_id].append(agent.agent_id)
+                    assigned += 1
+        
+        # Ensure minimum containers per agent in random mode
+        if self.config['distribution_mode'] == 'random':
+            min_containers, _ = self.config['containers_per_agent_range']
+            for agent in agents:
+                while len(self.agent_containers[agent.agent_id]) < min_containers:
+                    # Find a container to add
+                    available = [c for c in all_containers 
+                               if c not in self.agent_containers[agent.agent_id]]
+                    if available:
+                        container_id = random.choice(available)
+                        self.agent_containers[agent.agent_id].append(container_id)
+                        self.container_assignments[container_id].append(agent.agent_id)
+                    else:
+                        break
+    
+    def get_container_distribution_summary(self):
+        """Get a summary of the container distribution"""
+        summary = {
+            'total_containers': len(self.container_registry),
+            'agent_container_counts': {},
+            'container_copy_counts': {},
+            'overlap_matrix': {}
+        }
+        
+        # Count containers per agent
+        for agent_id, containers in self.agent_containers.items():
+            summary['agent_container_counts'][agent_id] = len(containers)
+        
+        # Count copies per container
+        for container_id, agents in self.container_assignments.items():
+            summary['container_copy_counts'][container_id] = len(agents)
+        
+        # Calculate overlap between agents
+        agent_ids = list(self.agent_containers.keys())
+        for i, agent1 in enumerate(agent_ids):
+            for agent2 in agent_ids[i+1:]:
+                containers1 = set(self.agent_containers[agent1])
+                containers2 = set(self.agent_containers[agent2])
+                overlap = len(containers1.intersection(containers2))
+                summary['overlap_matrix'][f"{agent1}-{agent2}"] = overlap
+        
+        return summary
 
 # =============================================================================
 # Main async function: Initializes agents, obtains decisions concurrently,
@@ -1648,9 +2547,6 @@ async def main():
 
     # Create conversation manager with database integration
     conversation_manager = ConversationManager(agents, db_manager, n_talks)
-
-    # Run the conversation round
-    await conversation_manager.run_round(TASK_INTRODUCTION_PROMPT)
     
     print("\nAll conversations completed. Logs have been stored in 'conversation_logs.db'.")
 
