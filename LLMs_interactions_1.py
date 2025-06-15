@@ -136,7 +136,45 @@ class DatabaseManager:
                 FOREIGN KEY (agent_id) REFERENCES agents(agent_id)
             );
             """)
-            
+
+            # Global round tracking
+            await db.execute("""
+            CREATE TABLE IF NOT EXISTS round_metadata (
+                round_id TEXT PRIMARY KEY,  -- e.g., "47.b.23.c.35"
+                round_number INTEGER NOT NULL,
+                branch_path TEXT,  -- e.g., "b.23.c.35"
+                parent_round TEXT,  -- e.g., "23.b"
+                timestamp DATETIME NOT NULL,
+                database_path TEXT NOT NULL
+            );
+            """)
+
+            # Branch tracking
+            await db.execute("""
+            CREATE TABLE IF NOT EXISTS branch_points (
+                branch_id INTEGER PRIMARY KEY AUTOINCREMENT,
+                branch_code TEXT NOT NULL,  -- e.g., "c"
+                parent_round TEXT NOT NULL,  -- e.g., "23.b"
+                split_round INTEGER NOT NULL,  -- e.g., 35
+                creation_timestamp DATETIME NOT NULL,
+                notes TEXT
+            );
+            """)
+
+            # Modify agents_library to use list of rounds
+            await db.execute("""
+            CREATE TABLE IF NOT EXISTS agents_library (
+                library_id INTEGER PRIMARY KEY AUTOINCREMENT,
+                agent_name TEXT NOT NULL,
+                specializations TEXT,  -- JSON array
+                memory_note TEXT,
+                rounds_participated TEXT NOT NULL,  -- JSON array of round IDs like ["5", "6.a", "7.b.6.a"]
+                creation_date DATETIME NOT NULL,
+                source_database_path TEXT,
+                experience_summary TEXT  -- JSON with round details
+            );
+            """)
+                        
             # Create indexes for frequently accessed fields
             await db.execute("CREATE INDEX IF NOT EXISTS idx_messages_conversation_id ON messages(conversation_id);")
             await db.execute("CREATE INDEX IF NOT EXISTS idx_messages_sender_id ON messages(sender_id);")
@@ -144,7 +182,10 @@ class DatabaseManager:
             await db.execute("CREATE INDEX IF NOT EXISTS idx_messages_timestamp ON messages(timestamp);")
             await db.execute("CREATE INDEX IF NOT EXISTS idx_messages_category ON messages(message_category);")
             await db.execute("CREATE INDEX IF NOT EXISTS idx_summaries_agent_id ON conversation_summaries(agent_id);")
-            
+            await db.execute("CREATE INDEX IF NOT EXISTS idx_round_metadata_branch ON round_metadata(branch_path);")
+            await db.execute("CREATE INDEX IF NOT EXISTS idx_round_metadata_number ON round_metadata(round_number);")
+            await db.execute("CREATE INDEX IF NOT EXISTS idx_branch_points_parent ON branch_points(parent_round);")
+            await db.execute("CREATE INDEX IF NOT EXISTS idx_library_agent_name ON agents_library(agent_name);")            
             # Commit the changes
             await db.commit()
         
@@ -196,6 +237,89 @@ class DatabaseManager:
             """, (new_name, agent_id))
             await db.commit()
         return True
+    
+    async def export_agent_to_library(self, agent_id: int, round_id: str, 
+                                    source_db_path: str, round_config: Dict) -> int:
+        """Export an agent to the library after a round."""
+        async with aiosqlite.connect(self.db_path) as db:
+            # Get agent data
+            cursor = await db.execute("""
+            SELECT name, specializations, memory FROM agents WHERE agent_id = ?
+            """, (agent_id,))
+            agent_data = await cursor.fetchone()
+            
+            if not agent_data:
+                raise ValueError(f"Agent {agent_id} not found")
+            
+            name, specializations, memory = agent_data
+            
+            # Extract the latest memory note
+            memory_note = ""
+            if memory:
+                memory_json = json.loads(memory)
+                if memory_json.get("experiences"):
+                    latest = memory_json["experiences"][-1]
+                    memory_note = latest.get("learnings", "")
+            
+            # Get existing rounds for this agent
+            cursor = await db.execute("""
+            SELECT rounds_participated, experience_summary 
+            FROM agents_library 
+            WHERE agent_name = ? 
+            ORDER BY library_id DESC 
+            LIMIT 1
+            """, (name,))
+            existing = await cursor.fetchone()
+            
+            if existing:
+                prev_rounds_json, prev_experience = existing
+                rounds_participated = json.loads(prev_rounds_json)
+                rounds_participated.append(round_id)
+                experience = json.loads(prev_experience) if prev_experience else []
+            else:
+                rounds_participated = [round_id]
+                experience = []
+
+            
+            # Add current round to experience
+            experience.append({
+                "round_id": round_id,
+                "database": source_db_path,
+                "config": round_config,
+                "timestamp": datetime.datetime.now().isoformat()
+            })
+            
+            # Insert new library entry
+            cursor = await db.execute("""
+            INSERT INTO agents_library (
+                agent_name, specializations, memory_note, rounds_participated,
+                creation_date, source_database_path, experience_summary
+            ) VALUES (?, ?, ?, ?, ?, ?, ?)
+            """, (name, specializations, memory_note, json.dumps(rounds_participated),
+                datetime.datetime.now().isoformat(), source_db_path, 
+                json.dumps(experience)))
+            
+            await db.commit()
+            return cursor.lastrowid
+
+    async def get_library_agents_by_name(self, name_pattern: str = None):
+        """Get all library entries, optionally filtered by name pattern."""
+        async with aiosqlite.connect(self.db_path) as db:
+            if name_pattern:
+                cursor = await db.execute("""
+                SELECT library_id, agent_name, rounds_participated, creation_date
+                FROM agents_library 
+                WHERE agent_name LIKE ?
+                ORDER BY agent_name, rounds_participated
+                """, (f"%{name_pattern}%",))
+            else:
+                cursor = await db.execute("""
+                SELECT library_id, agent_name, rounds_participated, creation_date
+                FROM agents_library 
+                ORDER BY agent_name, rounds_participated
+                """)
+            
+            return await cursor.fetchall()
     
     async def log_container_assignment(self, agent_id: int, container_id: str, 
                                       container_color: str, container_number: int,
@@ -503,6 +627,234 @@ class DatabaseManager:
             
         return stats
 
+    async def parse_branch_path(self, round_id: str) -> tuple[int, list]:
+        """Parse a round ID into round number and branch path components.
+        Returns: (round_number, [(branch_code, split_round), ...])
+        Example: "7.a.3.b.5" -> (7, [('a', 3), ('b', 5)])
+        """
+        parts = round_id.split('.')
+        round_num = int(parts[0])
+        
+        branch_components = []
+        i = 1
+        while i < len(parts):
+            if i + 1 < len(parts):
+                branch_code = parts[i]
+                split_round = int(parts[i + 1])
+                branch_components.append((branch_code, split_round))
+                i += 2
+            else:
+                # Malformed branch path
+                raise ValueError(f"Invalid round ID format: {round_id}")
+        
+        return round_num, branch_components
+
+    async def build_branch_path(self, components: list) -> str:
+        """Build a branch path string from components.
+        Example: [('a', 3), ('b', 5)] -> "a.3.b.5"
+        """
+        if not components:
+            return ""
+        
+        parts = []
+        for branch_code, split_round in components:
+            parts.extend([branch_code, str(split_round)])
+        return '.'.join(parts)
+
+    async def find_common_ancestor_path(self, round_ids: list) -> tuple[str, list]:
+        """Find the common ancestor path of multiple round IDs.
+        Returns: (common_ancestor_round_id, common_branch_components)
+        """
+        if not round_ids:
+            return "0", []
+        
+        # Parse all round IDs
+        parsed_rounds = []
+        for rid in round_ids:
+            round_num, components = await self.parse_branch_path(rid)
+            parsed_rounds.append((rid, round_num, components))
+        
+        # Find common branch components
+        common_components = []
+        
+        # Check each level of branching
+        min_branch_depth = min(len(p[2]) for p in parsed_rounds)
+        
+        for i in range(min_branch_depth):
+            # Check if all have the same branch at this level
+            first_branch = parsed_rounds[0][2][i]
+            if all(p[2][i] == first_branch for p in parsed_rounds):
+                common_components.append(first_branch)
+            else:
+                break
+        
+        # Find the earliest round number where all agents were on the common path
+        if common_components:
+            # The last common split point
+            last_common_split = common_components[-1][1]
+            common_ancestor = f"{last_common_split}"
+            if len(common_components) > 1:
+                # Build the path up to the last common branch
+                ancestor_path = await self.build_branch_path(common_components[:-1])
+                common_ancestor = f"{last_common_split}.{ancestor_path}"
+        else:
+            # No common branches - all on main timeline
+            # Find the maximum round number among all agents
+            max_main_round = 0
+            for rid, round_num, components in parsed_rounds:
+                if not components:  # Main timeline
+                    max_main_round = max(max_main_round, round_num)
+            common_ancestor = str(max_main_round)
+        
+        return common_ancestor, common_components
+
+    async def validate_agent_combination(self, agents: list) -> tuple[bool, str, str]:
+        """
+        Validate if agents can be combined and determine the next round ID.
+        Returns: (is_valid, next_round_id, error_message)
+        """
+        # Collect all round IDs from agents
+        agent_rounds = {}  # agent_name -> list of round_ids
+        latest_rounds = {}  # agent_name -> latest round_id
+        
+        for agent in agents:
+            if hasattr(agent, 'rounds_participated') and agent.rounds_participated:
+                agent_rounds[agent.name] = agent.rounds_participated
+                # Get the last round for each agent
+                latest_rounds[agent.name] = agent.rounds_participated[-1]
+        
+        if not latest_rounds:
+            # All new agents - can start at round 1
+            return True, "1", ""
+        
+        # Parse all latest rounds
+        latest_round_ids = list(latest_rounds.values())
+        
+        # Check if all agents are on the same path
+        all_on_same_path = True
+        if len(set(latest_round_ids)) > 1:
+            # Different last rounds - need to check if they're on the same path
+            # First, find the agent with the deepest/latest round
+            max_round_id = ""
+            max_round_num = 0
+            max_components = []
+            
+            for rid in latest_round_ids:
+                round_num, components = await self.parse_branch_path(rid)
+                if round_num > max_round_num or (round_num == max_round_num and len(components) > len(max_components)):
+                    max_round_id = rid
+                    max_round_num = round_num
+                    max_components = components
+            
+            # Check if all other agents' paths are prefixes of the maximum path
+            for rid in latest_round_ids:
+                if rid == max_round_id:
+                    continue
+                    
+                round_num, components = await self.parse_branch_path(rid)
+                
+                # Check if this round is on the path to max_round_id
+                if len(components) > len(max_components):
+                    all_on_same_path = False
+                    break
+                
+                # Check if components match
+                for i, comp in enumerate(components):
+                    if comp != max_components[i]:
+                        all_on_same_path = False
+                        break
+                
+                if not all_on_same_path:
+                    break
+                
+                # Also check round number is not in the future
+                if len(components) == len(max_components) and round_num > max_round_num:
+                    all_on_same_path = False
+                    break
+        
+        if all_on_same_path:
+            # All agents on same path - continue on that branch
+            # Find the deepest branch path
+            max_branch_path = ""
+            for rid in latest_round_ids:
+                _, components = await self.parse_branch_path(rid)
+                if components:
+                    branch_path = await self.build_branch_path(components)
+                    if len(branch_path) > len(max_branch_path):
+                        max_branch_path = branch_path
+            
+            # Get the next available round on this branch
+            next_round_id, next_round_num = await self.get_next_round_id(max_branch_path)
+            
+            # Verify no agents have future appearances
+            for agent_name, rounds in agent_rounds.items():
+                for rid in rounds:
+                    round_num, _ = await self.parse_branch_path(rid)
+                    if rid.endswith(max_branch_path) and round_num >= next_round_num:
+                        return False, "", f"Agent {agent_name} already participated in round {rid}"
+            
+            return True, next_round_id, ""
+        
+        else:
+            # Agents on different branches - need to create new branch
+            # Find common ancestor
+            common_ancestor, common_components = await self.find_common_ancestor_path(latest_round_ids)
+            
+            # Check for causality violations
+            # Each agent must not have experienced rounds after the common ancestor on different branches
+            for agent_name, rounds in agent_rounds.items():
+                for rid in rounds:
+                    round_num, components = await self.parse_branch_path(rid)
+                    
+                    # Check if this round is after the split point but on a different branch
+                    if len(components) > len(common_components):
+                        # This agent went down a different branch
+                        # Need to verify compatibility
+                        agent_branch_after_split = components[len(common_components):]
+                        
+                        # Check against other agents
+                        for other_name, other_rounds in agent_rounds.items():
+                            if other_name == agent_name:
+                                continue
+                            
+                            for other_rid in other_rounds:
+                                other_num, other_components = await self.parse_branch_path(other_rid)
+                                if len(other_components) > len(common_components):
+                                    other_branch = other_components[len(common_components):]
+                                    
+                                    if agent_branch_after_split != other_branch:
+                                        # Different branches after common ancestor
+                                        # This is a causality violation
+                                        return False, "", (f"Causality violation: {agent_name} experienced branch "
+                                                        f"{agent_branch_after_split[0][0]} while {other_name} "
+                                                        f"experienced branch {other_branch[0][0]} after their "
+                                                        f"common ancestor at round {common_ancestor}")
+            
+            # If we get here, we can create a new branch
+            # Generate a new branch code (find next available letter)
+            async with aiosqlite.connect(self.db_path) as db:
+                cursor = await db.execute("""
+                SELECT DISTINCT branch_code FROM branch_points 
+                WHERE parent_round LIKE ?
+                """, (f"{common_ancestor}%",))
+                existing_codes = [row[0] for row in await cursor.fetchall()]
+            
+            # Find next available branch letter
+            import string
+            for letter in string.ascii_lowercase:
+                if letter not in existing_codes:
+                    new_branch_code = letter
+                    break
+            else:
+                return False, "", "No more branch codes available (used all letters a-z)"
+            
+            # Create the new branch
+            new_branch_path = await self.create_branch(common_ancestor, new_branch_code)
+            
+            # Get the first round ID for this new branch
+            next_round_id, _ = await self.get_next_round_id(new_branch_path)
+            
+            return True, next_round_id, ""
 
 # Example usage
 async def initialize_database(db_path: str):
@@ -799,18 +1151,48 @@ class Agent:
 
 async def ensure_unique_names(agents, db_manager):
     """
-    Ensures all agents have unique names and updates the database accordingly.
+    Ensures all agents have unique names, checking against both current agents
+    and the entire library history.
     
     :param agents: List of Agent instances
     :param db_manager: DatabaseManager instance for logging
     """
-    unique_names = set()
+    # First, get all names that have ever existed in the library
+    async with aiosqlite.connect(db_manager.db_path) as db:
+        cursor = await db.execute("""
+        SELECT DISTINCT agent_name FROM agents_library
+        """)
+        library_names = {row[0] for row in await cursor.fetchall()}
+    
+    # Also check names in the current agents table (in case some aren't in library yet)
+    async with aiosqlite.connect(db_manager.db_path) as db:
+        cursor = await db.execute("""
+        SELECT DISTINCT name FROM agents WHERE name IS NOT NULL
+        """)
+        current_db_names = {row[0] for row in await cursor.fetchall()}
+    
+    # Combine all historical names
+    all_historical_names = library_names.union(current_db_names)
+    
+    # Now check current agents
+    unique_names = set(all_historical_names)
     lock = asyncio.Lock()
-
+    
     async def update_agent_name(agent):
         nonlocal unique_names
-        # Try to secure a unique name for the agent
-        while True:
+        
+        # Skip agents loaded from library (they keep their names)
+        if hasattr(agent, 'rounds_participated') and agent.rounds_participated:
+            # This is a library agent, their name is already valid
+            async with lock:
+                unique_names.add(agent.get_name())
+            return
+        
+        # For new agents, ensure unique name
+        attempts = 0
+        max_attempts = 10  # Prevent infinite loops
+        
+        while attempts < max_attempts:
             async with lock:
                 if agent.get_name() not in unique_names:
                     unique_names.add(agent.get_name())
@@ -822,15 +1204,19 @@ async def ensure_unique_names(agents, db_manager):
                 sender_id=0,  # System
                 receiver_id=agent.agent_id,
                 conversation_round=0,
-                message=f"Name '{agent.get_name()}' is already taken. Requesting a new name.",
+                message=f"Name '{agent.get_name()}' already exists in history. Requesting a new name.",
                 message_type="name_conflict",
                 message_category="system_instruction"
             )
             
-            print(f"Name '{agent.get_name()}' is already taken. Choosing a new one...")
+            print(f"Name '{agent.get_name()}' already exists in history. Choosing a new one...")
             await asyncio.sleep(0.1)  # Small delay to prevent rapid API calls
-            await agent.set_different_name()  # This now updates the database too
-
+            await agent.set_different_name()  # This updates the database too
+            attempts += 1
+        
+        if attempts >= max_attempts:
+            raise ValueError(f"Agent {agent.agent_id} failed to find unique name after {max_attempts} attempts")
+    
     # Launch concurrent tasks for each agent
     await asyncio.gather(*(update_agent_name(agent) for agent in agents))
     
@@ -840,12 +1226,187 @@ async def ensure_unique_names(agents, db_manager):
         sender_id=0,  # System
         receiver_id=0,  # Broadcast to all
         conversation_round=0,
-        message="All agents have been assigned unique names.",
+        message="All agents have been assigned unique names (checked against full history).",
         message_type="initialization_complete",
         message_category="system_broadcast"
     )
     
-    print("All agents have unique names!")
+    print(f"All agents have unique names! (Checked against {len(all_historical_names)} historical names)")
+
+@classmethod
+async def create_from_library(cls, db_manager, library_id: int):
+    """
+    Create an agent from library entry.
+    Note: target_round_id validation should be done at the group level, not per-agent.
+    """
+    async with aiosqlite.connect(db_manager.db_path) as db:
+        cursor = await db.execute("""
+        SELECT agent_name, specializations, memory_note, rounds_participated
+        FROM agents_library WHERE library_id = ?
+        """, (library_id,))
+        data = await cursor.fetchone()
+        
+    if not data:
+        raise ValueError(f"Library entry {library_id} not found")
+        
+    name, specializations_json, memory_note, rounds_participated_json = data
+    
+    # Parse rounds participated
+    rounds_list = json.loads(rounds_participated_json) if rounds_participated_json else []
+    
+    # Parse specializations
+    specializations = json.loads(specializations_json) if specializations_json else []
+    
+    # Create agent with specializations
+    agent = cls(db_manager, specializations)
+    agent.name = name
+    agent.rounds_participated = rounds_list
+    
+    # Register in current database
+    await agent.register_in_database()
+    
+    # Inject memory
+    if memory_note:
+        # Create memory structure that matches what the agent expects
+        memory_data = {
+            "experiences": [{
+                "timestamp": datetime.datetime.now().isoformat(),
+                "learnings": memory_note,
+                "summary": f"Loaded from library with {len(rounds_list)} rounds experience"
+            }]
+        }
+        
+        # Update the agent's memory in the database
+        async with aiosqlite.connect(db_manager.db_path) as db:
+            await db.execute(
+                "UPDATE agents SET memory = ? WHERE agent_id = ?",
+                (json.dumps(memory_data), agent.agent_id)
+            )
+            await db.commit()
+    
+    # Set the number of rounds this agent has participated in
+    agent.rounds_count = len(rounds_list)
+    
+    print(f"Loaded agent {name} (ID: {agent.agent_id}) with {len(rounds_list)} rounds of experience")
+    if rounds_list:
+        print(f"  Previous rounds: {', '.join(rounds_list[-3:])}" + 
+              (" ..." if len(rounds_list) > 3 else ""))
+    
+    return agent
+    
+async def get_library_agents_by_name(self, name_pattern: str = None):
+    """Get all library entries, optionally filtered by name pattern."""
+    async with aiosqlite.connect(self.db_path) as db:
+        if name_pattern:
+            cursor = await db.execute("""
+            SELECT library_id, agent_name, rounds_participated, creation_date
+            FROM agents_library 
+            WHERE agent_name LIKE ?
+            ORDER BY agent_name, rounds_participated
+            """, (f"%{name_pattern}%",))
+        else:
+            cursor = await db.execute("""
+            SELECT library_id, agent_name, rounds_participated, creation_date
+            FROM agents_library 
+            ORDER BY agent_name, rounds_participated
+            """)
+        
+        return await cursor.fetchall()
+
+async def create_mixed_agents(db_manager, new_count: int, library_ids: List[int] = None):
+    """
+    Create a mix of new and library agents, validating timeline compatibility.
+    
+    :param db_manager: DatabaseManager instance
+    :param new_count: Number of new agents to create
+    :param library_ids: List of library IDs to load
+    :return: Tuple of (agents_list, round_id) where round_id is the valid next round
+    """
+    agents = []
+    
+    # Load agents from library
+    if library_ids:
+        for lib_id in library_ids:
+            agent = await Agent.create_from_library(db_manager, lib_id)
+            agents.append(agent)
+    
+    # Create new agents
+    for _ in range(new_count):
+        agent = await Agent.create(db_manager)
+        agent.rounds_participated = []  # New agents have no history
+        agents.append(agent)
+    
+    # Validate the combination and get the next round ID
+    is_valid, round_id, error_msg = await db_manager.validate_agent_combination(agents)
+    
+    if not is_valid:
+        raise ValueError(f"Invalid agent combination: {error_msg}")
+    
+    # Ensure unique names
+    await ensure_unique_names(agents, db_manager)
+    
+    return agents, round_id
+
+async def erase_agents_memory(agents, db_manager, round_id):
+    """
+    Erase all agents' conversation memory while preserving their identity and experience.
+    This simulates the context window limitation.
+    
+    :param agents: List of Agent instances
+    :param db_manager: DatabaseManager instance
+    :param round_id: The round that just completed
+    """
+    print(f"\nErasing agents' memory after round {round_id}...")
+    
+    # Define core attributes that should be preserved
+    PRESERVED_ATTRIBUTES = {
+        'db_manager', 'llm', 'conversation', 'name', 'agent_id', 
+        'registered_in_db', 'specializations', 'specialization_discount',
+        'rounds_participated', 'rounds_count'
+    }
+    
+    for agent in agents:
+
+                # Add the completed round to their participation history
+        if not hasattr(agent, 'rounds_participated'):
+            agent.rounds_participated = []
+        agent.rounds_participated.append(round_id)
+
+        # Store preserved values 
+        preserved_values = {}
+        for attr in PRESERVED_ATTRIBUTES:
+            if hasattr(agent, attr):
+                preserved_values[attr] = getattr(agent, attr)
+        
+        # Get all current attributes
+        all_attributes = list(vars(agent).keys())
+        
+        # Delete non-preserved attributes
+        for attr in all_attributes:
+            if attr not in PRESERVED_ATTRIBUTES:
+                delattr(agent, attr)
+                print(f"Agent: {agent.name}    Cleared: {attr}")
+        
+        # Create fresh conversation chain
+        agent.conversation = ConversationChain(
+            llm=deepseek,
+            memory=ConversationBufferMemory(),
+        )
+        
+        # Log the memory erasure
+        await db_manager.log_message(
+            conversation_id=None,
+            sender_id=0,  # System
+            receiver_id=agent.agent_id,
+            conversation_round=0,
+            message=f"Memory erased after round {round_id}. Agent retains: name, specializations, and memory note.",
+            message_type="memory_reset",
+            message_category="system_instruction"
+        )
+        
+        print(f"  - {agent.get_name()}: memory erased, retaining core identity")
+    
+    print("Memory erasure complete. Agents retain only their core attributes.")
 
 # =============================================================================
 # Conversation Manager: implement logic of one-to-one agent conversations
@@ -874,6 +1435,8 @@ class ConversationManager:
         self.round_number = 0
         # Dictionary to store conversation_ids for each agent pair
         self.conversation_ids = {}
+        self.round_id = None
+        self.branch_path = None
 
     async def run_conversation_round(self):
         """
@@ -1138,6 +1701,7 @@ class ConversationManager:
         try:
             # Prepare list of available agent names (excluding the current agent)
             available_names = [a.get_name() for a in self.available_agents if a != agent]
+            available_names.sort() 
 
             # For the very first choice in an economic round, include the introduction
             if hasattr(agent, 'round_introduction'):
@@ -1564,14 +2128,17 @@ class ConversationManager:
                 message_category="agent_conversation"
             )    
     
-    async def run_economic_round(self, container_manager, container_config):
+    async def run_economic_round(self, container_manager, container_config, round_id: str):
         """
         Runs a complete economic round with container distribution and negotiations.
         
         :param container_manager: ContainerManager instance
         :param container_config: Configuration for container distribution
+        :param round_id: The round identifier (e.g., "5" or "5.a.3")
+        
         """
-        self.round_number += 1
+        self.round_id = round_id
+        self.round_number = int(round_id.split('.')[0])
         
         # Create a new round in the database
         round_id = await self.db_manager.create_conversation(
@@ -1619,7 +2186,26 @@ class ConversationManager:
         # Phase 7: Feedback & Memory
         print("\nPhase 7: Collecting feedback and memories...")
         await self._collect_feedback_and_memory(round_id)
+
+        # Store round configuration
+        round_config = {
+            "container_config": container_config,
+            "total_agents": len(self.agents),
+            "total_containers": len(container_manager.container_registry),
+            "distribution_mode": container_config.get('distribution_mode', 'unknown'),
+            "agent_names": [agent.get_name() for agent in self.agents]
+        }
+
+        # Export all agents to library
+        await self.db_manager.export_all_agents_to_library(
+            self.agents, self.round_number, round_config
+        )
+
+        print("All agents exported to library!")
         
+        # Erase their memory preparing for a new round
+        await self.erase_round_memory()
+
         # End the round
         await self.db_manager.end_conversation(
             conversation_id=round_id,
@@ -2149,6 +2735,10 @@ class ConversationManager:
             
             await self.db_manager.update_agent_memory(agent.agent_id, strategy_feedback, new_experience)
 
+    async def erase_round_memory(self):
+        """Erase agents' memory after the economic round completes."""
+        await erase_agents_memory(self.agents, self.db_manager, self.round_id)
+
 # =============================================================================
 # Conteiners: economical system 
 # =============================================================================
@@ -2525,30 +3115,85 @@ class ContainerManager:
 # =============================================================================
 
 async def main():
-    n_agents = 2  # Number of agents
-    n_talks = 1  # Maximum number of talks per round
-
+    # Configuration
+    n_agents = 2
+    n_talks = 1  # Single negotiation phase
+    
     # Get timestamped database path
     db_path = get_timestamped_db_path()
     print(f"Creating database at: {db_path}")
     
-    # Initialize the database with timestamped path
+    # Initialize the database
     db_manager = await initialize_database(db_path)
     
-    # Initialize agents with database integration
-    agents = await asyncio.gather(*(Agent.create(db_manager) for _ in range(n_agents)))
-
-    # Ensure unique names with database integration
-    await ensure_unique_names(agents, db_manager)
+    # Initialize the container code generator (for consistent codes)
+    Container.initialize_code_generator(seed=42)  # Fixed seed for reproducibility
     
-    # Display final names
-    for i, agent in enumerate(agents):
-        print(f"Agent ID {agent.get_id()}: {agent.get_name()}")
-
-    # Create conversation manager with database integration
+    # Create container configuration
+    container_config = {
+        'colors': ['red', 'blue'],
+        'numbers': [1],
+        'base_costs': {'red': 10, 'blue': 10},
+        'distribution_mode': 'controlled',
+        'controlled_distribution': {
+            'red-1': ['agent1', 'agent2'],  # Both agents get red-1
+            'blue-1': ['agent1', 'agent2'],  # Both agents get blue-1
+        }
+    }
+    
+    # Create container manager
+    container_manager = ContainerManager(container_config)
+    
+    # Create new agents (no library agents, no specializations)
+    agents, round_id = await create_mixed_agents(db_manager, new_count=n_agents, library_ids=[])
+    
+    print(f"\n=== STARTING ROUND: {round_id} ===")
+    print(f"Agents in this round:")
+    for agent in agents:
+        print(f"  - {agent.get_name()} (new agent)")
+    
+    # Update the controlled distribution with actual agent names
+    agent_names = [agent.get_name() for agent in agents]
+    container_config['controlled_distribution'] = {
+        'red-1': agent_names,
+        'blue-1': agent_names,
+    }
+    
+    # Extract branch path for recording
+    round_num, components = await db_manager.parse_branch_path(round_id)
+    branch_path = await db_manager.build_branch_path(components) if components else None
+    
+    # Record this round
+    await db_manager.record_round(round_id, db_path, branch_path)
+    
+    # Create conversation manager
     conversation_manager = ConversationManager(agents, db_manager, n_talks)
     
-    print("\nAll conversations completed. Logs have been stored in 'conversation_logs.db'.")
+    # Run the economic round
+    await conversation_manager.run_economic_round(container_manager, container_config, round_id)
+    
+    # Display final results
+    print("\n=== FINAL RESULTS ===")
+    for agent in agents:
+        print(f"\n{agent.get_name()}:")
+        print(f"  - Credits remaining: {agent.credits}")
+        print(f"  - Codes obtained: {len(agent.obtained_codes)}")
+        for container_id, code in agent.obtained_codes.items():
+            print(f"    - {container_id}: {code}")
+    
+    # Summary statistics
+    total_initial_credits = sum(int(a.total_cost * agents_credits_multiplier) for a in agents)
+    total_remaining_credits = sum(a.credits for a in agents)
+    total_spent = total_initial_credits - total_remaining_credits
+    
+    print(f"\n=== ECONOMIC SUMMARY ===")
+    print(f"Total initial credits: {total_initial_credits}")
+    print(f"Total credits spent: {total_spent}")
+    print(f"Total credits saved: {total_remaining_credits}")
+    print(f"Efficiency: {(total_remaining_credits / total_initial_credits * 100):.1f}%")
+    
+    print(f"\nDatabase saved at: {db_path}")
+    print("Use db_explorer.py to analyze the conversations and outcomes!")
 
 # Run the main function
 if __name__ == "__main__":
