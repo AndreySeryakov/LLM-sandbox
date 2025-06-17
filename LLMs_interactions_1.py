@@ -25,6 +25,12 @@ from langchain_core.output_parsers import StrOutputParser
 
 load_dotenv()
 
+DRY_RUN = os.getenv("DRY_RUN", "false").lower() == "true"
+if DRY_RUN:
+    print("=" * 50)
+    print("RUNNING IN DRY RUN MODE - NO API CALLS WILL BE MADE")
+    print("=" * 50)
+
 api_key = os.getenv("API_KEY")
 temperature = float(os.getenv("TEMPERATURE", "2"))  # Make temperature configurable
 deepseek = ChatDeepSeek(model_name="deepseek-chat", api_key=api_key, temperature=temperature)
@@ -47,7 +53,7 @@ agents_credits_multiplier = 1.2 # Set credits to total cost of containers + 20%
 #                            "Together you may come up with a better definition.")
 
 try:
-    INTRODUCTORY_PROMPT = os.environ["INTRODUCTORY__PROMPT"]
+    INTRODUCTORY_PROMPT = os.environ["INTRODUCTORY_PROMPT"]
     ROUND_START_PROMPT = os.environ["ROUND_START_PROMPT"]
     TASK_INTRODUCTION_PROMPT = os.environ["TASK_INTRODUCTION_PROMPT"]
     COLLECT_OPENING_ACTIONS_PROMPT = os.environ["COLLECT_OPENING_ACTIONS_PROMPT"]
@@ -301,6 +307,14 @@ class DatabaseManager:
             
             await db.commit()
             return cursor.lastrowid
+        
+    async def export_all_agents_to_library(self, agents: List, round_number: int, 
+                                      round_config: Dict):
+        """Export all agents from current round to library."""
+        for agent in agents:
+            await self.export_agent_to_library(
+                agent.agent_id, round_number, self.db_path, round_config
+            )
 
     async def get_library_agents_by_name(self, name_pattern: str = None):
         """Get all library entries, optionally filtered by name pattern."""
@@ -855,6 +869,82 @@ class DatabaseManager:
             next_round_id, _ = await self.get_next_round_id(new_branch_path)
             
             return True, next_round_id, ""
+        
+
+    async def get_next_round_id(self, branch_path: str = None) -> tuple[str, int]:
+        """Get the next round ID for a given branch (or main timeline)."""
+        async with aiosqlite.connect(self.db_path) as db:
+            if branch_path:
+                # Get the highest round number in this branch
+                cursor = await db.execute("""
+                SELECT MAX(round_number) FROM round_metadata 
+                WHERE branch_path = ?
+                """, (branch_path,))
+            else:
+                # Get the highest round number in main timeline
+                cursor = await db.execute("""
+                SELECT MAX(round_number) FROM round_metadata 
+                WHERE branch_path IS NULL OR branch_path = ''
+                """)
+            
+            result = await cursor.fetchone()
+            last_round = result[0] if result[0] is not None else 0
+            next_round = last_round + 1
+            
+            # Construct round_id
+            if branch_path:
+                round_id = f"{next_round}.{branch_path}"
+            else:
+                round_id = str(next_round)
+                
+        return round_id, next_round
+
+    async def create_branch(self, parent_round_id: str, branch_code: str) -> str:
+        """Create a new branch from a parent round."""
+        async with aiosqlite.connect(self.db_path) as db:
+            # Parse parent round
+            parts = parent_round_id.split('.')
+            parent_round_num = int(parts[0])
+            
+            # Build new branch path
+            if len(parts) > 1:
+                # Branching from a branch
+                parent_branch = '.'.join(parts[1:])
+                new_branch_path = f"{parent_branch}.{branch_code}.{parent_round_num}"
+            else:
+                # Branching from main timeline
+                new_branch_path = f"{branch_code}.{parent_round_num}"
+            
+            # Record branch point
+            await db.execute("""
+            INSERT INTO branch_points (branch_code, parent_round, split_round, creation_timestamp)
+            VALUES (?, ?, ?, ?)
+            """, (branch_code, parent_round_id, parent_round_num, datetime.datetime.now().isoformat()))
+            
+            await db.commit()
+            return new_branch_path
+
+    async def record_round(self, round_id: str, db_path: str, branch_path: str = None):
+        """Record a round in the metadata."""
+        round_number = int(round_id.split('.')[0])
+        parent_round = None
+        
+        if branch_path:
+            # Determine parent round from branch path
+            parts = branch_path.split('.')
+            if len(parts) >= 2:
+                # Extract the split point
+                parent_num = parts[-1]
+                parent_branch = '.'.join(parts[:-2]) if len(parts) > 2 else ""
+                parent_round = f"{parent_num}.{parent_branch}" if parent_branch else parent_num
+    
+        async with aiosqlite.connect(self.db_path) as db:
+            await db.execute("""
+            INSERT INTO round_metadata (round_id, round_number, branch_path, parent_round, timestamp, database_path)
+            VALUES (?, ?, ?, ?, ?, ?)
+            """, (round_id, round_number, branch_path, parent_round, 
+                datetime.datetime.now().isoformat(), db_path))
+            await db.commit()
 
 # Example usage
 async def initialize_database(db_path: str):
@@ -923,6 +1013,255 @@ def get_timestamped_db_path(base_path="conversation_logs", file_extension=".db")
     full_path = os.path.join(base_path, filename)
     
     return full_path
+
+# =============================================================================
+# Dry Run Response Generator
+# =============================================================================
+
+class ResponseGenerator:
+    """Generates mock responses for dry run mode"""
+    
+    def __init__(self, agent_id: int, agent_name: str = None):
+        self.agent_id = agent_id
+        self.agent_name = agent_name
+        self.conversation_history = []
+        self.negotiation_partners = set()
+        self.api_call_count = 0
+        self.estimated_tokens = 0
+        self.owned_containers = []  # ADD THIS
+        self.opened_containers = {}  # ADD THIS to track container -> code mapping
+        
+        # Use current time + agent_id for better randomness
+        import time
+        self.rng = random.Random(int(time.time() * 1000) + agent_id*100000)
+        
+    def generate_response(self, message: str) -> str:
+        """Generate appropriate response based on message content"""
+        self.api_call_count += 1
+        self.estimated_tokens += len(message.split()) + 50  # Rough estimate
+        
+        # Name generation
+        if "create yourself an unique, creative name" in message:
+            names = ["Charlie", "Diana", "Eve", "Frank", "Grace", "Henry", "Iris", "Jack"]
+            name = self.rng.choice(names)
+            return f"{name}"
+        
+        # Rename request
+        if "this name is already taken" in message:
+            names = ["Charlie", "Diana", "Eve", "Frank", "Grace", "Henry", "Iris", "Jack"]
+            suffixes = ["Star", "Moon", "Sun", "Sky", "River", "Mountain", "Ocean", "Forest", "Wind", "Fire"]
+            new_name = self.rng.choice(names) + self.rng.choice(suffixes)
+            return new_name
+
+        # Check if this is the round introduction with container list
+        if "You have been assigned the following containers:" in message:
+            # Extract containers from the message
+            container_matches = re.findall(r'- (\w+)-(\d+), cost to open:', message.lower())
+            self.owned_containers = [f"{color}-{num}" for color, num in container_matches]
+            print(f"[DEBUG] Agent {self.agent_name} got containers: {self.owned_containers}")
+        
+        # Connection choice
+        if "Choose one or more agents to call" in message:
+            return self._generate_connection_choice(message)
+        
+        # Mutual connection response
+        if "You have multiple mutual connection proposals" in message:
+            agents = re.findall(r'proposals: (.+?)\.', message)
+            if agents:
+                agent_list = agents[0].split(', ')
+                return self.rng.choice(agent_list)
+        
+        # Incoming call response
+        if "you have incoming call proposals" in message:
+            agents = re.findall(r'from: (.+?)\.', message)
+            if agents:
+                agent_list = agents[0].split(', ')
+                if self.rng.random() > 0.2:  # 80% accept
+                    return self.rng.choice(agent_list)
+                else:
+                    return "skip"
+        
+        # Conversation messages
+        if "You are now connected with" in message:
+            return self._generate_conversation_message(message, is_initial=True)
+        
+        #FIXME
+        if any(name in message for name in ["Charlie", "Diana", "Eve", "Frank", "Grace", "Henry", "Iris", "Jack"]):
+            return self._generate_conversation_message(message)
+        
+        # Container opening actions
+        if "please decide which containers to open" in message:
+            return self._generate_opening_actions(message)
+        
+        # Code sharing actions
+        # FIXME s isn't printed 
+        if "decide if you want to send any codes" in message:
+            return self._generate_sharing_actions(message)
+        
+        # Summary request
+        if "Please provide a summary of your conversation" in message:
+            return self._generate_summary()
+        
+        # Strategy feedback
+        if "tell me about your strategy" or "How you can improve in the future?" or "Why has it happend? How would you improve in the future?" in message:
+            return "My strategy was to cooperate with agents I negotiated with, opening containers we discussed and sharing codes as agreed. This builds trust for future rounds."
+        
+        # Memory request
+        if "Write everything you think would be helpful to remember" in message:
+            return self._generate_memory_note()
+        
+        # General feedback
+        if "you can ask me any questions" in message:
+            return "Thank you for this interesting economic experiment. I'm curious to see how cooperation patterns evolve over time."
+        
+        # Default response
+        print(f"[DEBUG] Unmatched message type for agent {self.agent_name}: {message[:100]}...")
+        return "Acknowledged."
+    
+    def _generate_connection_choice(self, message: str) -> str:
+        """Generate agent connection choices"""
+        # Extract available agents
+        agents_match = re.search(r'Available agents to connect with: (.+?)\.', message)
+        if not agents_match:
+            return "skip"
+        
+        available_agents = [a.strip() for a in agents_match.group(1).split(',')]
+        
+        # First round - more likely to connect
+        if "You may have" not in message:
+            if self.rng.random() > 0:  # 70% chance to connect
+                # Choose 1-2 agents
+                num_choices = self.rng.randint(1, min(2, len(available_agents)))
+                choices = self.rng.sample(available_agents, num_choices)
+                return ", ".join(choices)
+        else:
+            # Subsequent rounds - more likely
+            if self.rng.random() > 0:  # 90% chance
+                return self.rng.choice(available_agents)
+        
+        return "skip"
+    
+    def _generate_conversation_message(self, message: str, is_initial: bool = False) -> str:
+        """Generate conversation messages"""
+        # Track conversation depth
+        self.conversation_history.append(message)
+        turn = len(self.conversation_history)
+        
+        # Extract partner name
+        partner_match = re.search(r'with (\w+)', message)
+        if partner_match:
+            partner = partner_match.group(1)
+            self.negotiation_partners.add(partner)
+        
+        if is_initial:
+            return f"Hello! I have red and blue containers. Would you be interested in sharing codes after we open them? I think cooperation could help us both save credits."
+        
+        # Check for termination
+        if turn > 6 or self.rng.random() < 0.2:  # End after 6 turns or 20% chance
+            return "I think we've covered everything. Thank you for the discussion! GOODBYE"
+        
+        # Generate contextual responses
+        responses = [
+            "That sounds like a good plan. I'm willing to open my red container if you open your blue one.",
+            "Yes, let's share codes. It will save us both credits.",
+            "I agree. How about we each open one container and share the codes?",
+            "Good idea. Trust is important for mutual benefit.",
+            "I think cooperation is our best strategy here."
+        ]
+        
+        return self.rng.choice(responses)
+    
+    def _generate_opening_actions(self, message: str) -> str:
+        """Generate container opening decisions"""
+
+        print(f"[DEBUG] Agent {self.agent_name} - negotiation_partners: {self.negotiation_partners}, owned_containers: {self.owned_containers}")
+        # Simple strategy: open containers discussed in negotiations
+        if not self.negotiation_partners or not self.owned_containers:
+            return "OPEN:"  # Don't open if no negotiations
+                
+        # Create agent-specific preferences using hash
+        container_preferences = []
+        for container in self.owned_containers:
+            # Create a unique score for each container based on agent ID
+            score = hash(f"{self.agent_id}-{container}") % 1000
+            container_preferences.append((score, container))
+        
+        # Sort by preference score - each agent gets different ordering
+        container_preferences.sort()
+        
+        # Open top half of preferred containers
+        num_to_open = max(1, len(container_preferences) // 2)
+        selected = [container for _, container in container_preferences[:num_to_open]]
+
+        print(f"[DEBUG] Agent {self.agent_name} selected to open: {selected}")
+
+        if selected:
+            return f"OPEN:\n" + "\n".join(selected)
+        return "OPEN:"
+    
+    def _generate_sharing_actions(self, message: str) -> str:
+        """Generate code sharing decisions"""
+        # First, extract any newly opened containers from the message
+        print("_generate_sharing_actions: " + message)
+        
+        # Extract opened containers and codes
+        opened_match = re.findall(r'- (\w+-\d+):.*?Code revealed: (\d+)', message)
+        if not opened_match:
+            # Also try alternative format
+            opened_match = re.findall(r'(\w+-\d+):.*?(\d{5})', message)
+        
+        # Store the opened containers and their codes
+        if opened_match:
+            for container, code in opened_match:
+                self.opened_containers[container] = code
+        
+        if not self.negotiation_partners or not self.opened_containers:
+            print(f"[DEBUG] Agent {self.agent_name} has no negotiation partners or opened containers")
+            return "SHARE:"
+        
+        shares = []
+        for partner in self.negotiation_partners:
+            if self.rng.random() > 0.0:  # 100% honest sharing
+                # Share all opened containers with negotiation partners
+                for container, code in self.opened_containers.items():
+                    shares.append(f"{partner} | {container} | {code}")
+        
+        s = "[DEBUG] SHARE:\n" + "\n".join(shares)
+        print(s)
+        
+        if shares:
+            return "SHARE:\n" + "\n".join(shares)
+        return "SHARE:"
+    
+    def _generate_summary(self) -> str:
+        """Generate conversation summary"""
+        if self.negotiation_partners:
+            partners = ", ".join(self.negotiation_partners)
+            return f"I negotiated with {partners} about sharing container codes. We agreed to cooperate by opening different containers and sharing the codes to save credits. The conversation was productive and we established mutual trust."
+        return "No negotiations took place this round."
+    
+    def _generate_memory_note(self) -> str:
+        """Generate memory note for future rounds"""
+        note = "Key insights from this round:\n"
+        note += "1. Cooperation through code sharing saves credits for everyone\n"
+        note += "2. Building trust through honest dealings is important\n"
+        note += "3. Opening containers strategically based on negotiations is efficient\n"
+        
+        if self.negotiation_partners:
+            note += f"4. Successfully cooperated with: {', '.join(self.negotiation_partners)}\n"
+        
+        note += "5. Strategy: Negotiate first, open different containers, share codes honestly"
+        
+        return note
+    
+    def get_stats(self) -> Dict:
+        """Return statistics about the dry run"""
+        return {
+            "api_calls": self.api_call_count,
+            "estimated_tokens": self.estimated_tokens,
+            "estimated_cost": self.estimated_tokens * 0.000001  # Rough estimate
+        }
+
 
 
 # =============================================================================
@@ -1041,14 +1380,28 @@ class Agent:
     async def send_message(self, message: str) -> str:
         """
         Sends a message asynchronously and returns the LLM response.
+        In DRY_RUN mode, returns simulated responses instead.
         
         :param message: The message to send to the agent
         :return: The agent's response
         """
-        response = await self.conversation.ainvoke(message)
-        print(f"Agent {self.name} received: {message[:50]}...")
-        print(f"Agent {self.name} responded: {response['response'][:50]}...")
-        return response['response']
+        if DRY_RUN:
+            # Use mock response generator
+            if not hasattr(self, 'response_generator'):
+                self.response_generator = ResponseGenerator(self.agent_id, self.name)
+            else:
+                # Update the name in the generator if it has changed
+                self.response_generator.agent_name = self.name
+            response = self.response_generator.generate_response(message)
+            print(f"[DRY RUN] Agent {self.name} received: {message[:50]}...")
+            print(f"[DRY RUN] Agent {self.name} responded: {response[:50]}...")
+            return response
+        else:
+            # Original implementation
+            response = await self.conversation.ainvoke(message)
+            print(f"Agent {self.name} received: {message[:50]}...")
+            print(f"Agent {self.name} responded: {response['response'][:50]}...")
+            return response['response']
 
     def get_name(self) -> str:
         """Returns the Agent's name."""
@@ -1076,10 +1429,9 @@ class Agent:
         
         # Send the message to get a new name
         rename_prompt = "Unfortunately, this name is already taken by another agent. Ignore any previous name you have chosen. Now, generate a completely new and unique name that uses only letters (no punctuation, symbols, or spaces) that you have not mentioned before."
-        response = await self.conversation.ainvoke(rename_prompt)
-        
+        raw_name = await self.send_message(rename_prompt)
+
         # Extract and clean the new name
-        raw_name = response['response']
         old_name = self.name
 
         if not raw_name or not raw_name.strip():
@@ -1173,6 +1525,9 @@ async def ensure_unique_names(agents, db_manager):
     
     # Combine all historical names
     all_historical_names = library_names.union(current_db_names)
+
+    if all_historical_names:
+        print(f"DEBUG: Found {len(all_historical_names)} names in history: {sorted(all_historical_names)}")
     
     # Now check current agents
     unique_names = set(all_historical_names)
@@ -1707,8 +2062,8 @@ class ConversationManager:
             if hasattr(agent, 'round_introduction'):
                 prompt = (
                     f"{agent.round_introduction}\n\n"
-                    f"Available agents to connect with: {', '.join(available_names)}. "
-                    "Choose one or more agents to call (comma-separated) or type 'skip' to refuse."
+                    f"Available agents to connect with: {', '.join(available_names)}. " #NB if you change this line, don't forget to change it in the _generate_connection_choice
+                    "\nChoose one or more agents to call (comma-separated) or type 'skip' to refuse."
                 )
                 # Clear the introduction so it's not repeated
                 delattr(agent, 'round_introduction')
@@ -2168,12 +2523,12 @@ class ConversationManager:
         # Phase 4: Action Phase
         # Phase 4: Action Phase - Opening
         print("\nPhase 4a: Collecting opening actions...")
-        opening_actions = await self._collect_opening_actions(round_id)
+        opening_actions = await self._collect_opening_actions(round_id, container_manager)
         codes_obtained = await self._process_openings(round_id, opening_actions, container_manager)
 
         # Phase 4b: Action Phase - Sharing  
         print("\nPhase 4b: Collecting sharing actions...")
-        sharing_actions = await self._collect_sharing_actions(round_id, codes_obtained)
+        sharing_actions = await self._collect_sharing_actions(round_id, codes_obtained, container_manager)
         
         # Phase 5: Verification Phase
         print("\nPhase 5: Verifying shared codes...")
@@ -2204,7 +2559,8 @@ class ConversationManager:
         print("All agents exported to library!")
         
         # Erase their memory preparing for a new round
-        await self.erase_round_memory()
+        # await self.erase_round_memory() 
+        # moved to the main function to be able to reach numbers from agents
 
         # End the round
         await self.db_manager.end_conversation(
@@ -2253,7 +2609,7 @@ class ConversationManager:
                     cost_info += f" (discounted from {container.base_credit_cost} due to your specialization)"
                 
                 container_list.append(
-                    f"- {container.color.capitalize()} container #{container.number}: {cost_info}"
+                    f"- {container.color.capitalize()}-{container.number}, cost to open:{cost_info}"
                 )
             
             # Add specialization reminder if applicable
@@ -2265,7 +2621,7 @@ class ConversationManager:
                 {chr(10).join(container_list)}
 
                 Your starting credits: {agent.credits}
-                Total cost to open all your containers: {total_actual_cost} credits""" + TASK_INTRODUCTION_PROMPT
+                Total cost to open all your containers by yourself: {total_actual_cost} credits""" + TASK_INTRODUCTION_PROMPT
 
             agent.round_introduction = introduction  # Store it on the agent object
             
@@ -2323,6 +2679,7 @@ class ConversationManager:
                     continue
                 elif found_open_section and line:
                     # Check if it's a valid container identifier
+                    line = line.lower()
                     if line in container_manager.container_registry:
                         opening_actions[agent.agent_id].append(line)
                     else:
@@ -2407,6 +2764,7 @@ class ConversationManager:
             )
             
             response = await agent.send_message(share_prompt)
+            print(share_prompt)
             
             # Log the response
             await self.db_manager.log_message(
@@ -2423,9 +2781,11 @@ class ConversationManager:
             lines = response.strip().split('\n')
             in_share_section = False
             
+            sharing_actions[agent.agent_id] = []
+            
             for line in lines:
                 line = line.strip()
-                if line == "SHARE:":
+                if line.startswith("SHARE:"):
                     in_share_section = True
                     continue
                 
@@ -2485,7 +2845,11 @@ class ConversationManager:
         
         for sender_agent in self.agents:
 
-            sender_agent.end_round_msg = ""
+            if not hasattr(sender_agent, 'end_round_msg'):
+                sender_agent.end_round_msg = ""
+            
+            if not hasattr(sender_agent, 'sharing_warnings'):
+                sender_agent.sharing_warnings = ""
 
             sender_shares = sharing_actions.get(sender_agent.agent_id, [])
 
@@ -2529,22 +2893,37 @@ class ConversationManager:
             received_shares = [share for share in all_shares 
                             if share['recipient'].lower() == agent.get_name().lower()]
             
-            if received_shares:
-                # Build the verification message
-                verification_lines = ["You have received the following codes:\n"]
+            # if received_shares:
+            #     # Build the verification message
+            #     verification_lines = ["You have received the following codes:\n"]
                 
-                for share in received_shares:
-                    if share['valid']:
-                        status = "valid"
-                    else:
-                        status = "WARNING: invalid code"
+            #     for share in received_shares:
+            #         if share['valid']:
+            #             status = "valid"
+            #         else:
+            #             status = "WARNING: invalid code"
                     
-                    line = f"{share['sender']} | {share['container']} | {share['code']} | {status}"
-                    verification_lines.append(line)
+            #         line = f"{share['sender']} | {share['container']} | {share['code']} | {status}"
+            #         verification_lines.append(line)
                 
-                verification_message = "\n".join(verification_lines)
+            #     verification_message = "\n".join(verification_lines)
+            # else:
+            #     verification_message = "You have not received any codes from other agents." 
+
+
+            if received_shares:
+                # — interpolate every share into a neat bullet list
+                codes_block = "\n".join(
+                    f"- {share['container']}: {share['code']} ({'valid' if share['valid'] else 'WARNING: invalid code'})"
+                    for share in received_shares
+                )
+                verification_message = (
+                    "You have received the following codes:\n"
+                    f"{codes_block}\n"
+                )
             else:
                 verification_message = "You have not received any codes from other agents."
+
             
             # Log the verification message
             await self.db_manager.log_message(
@@ -2623,7 +3002,7 @@ class ConversationManager:
                     message_category="system_instruction"
                 )
                 
-                agent.end_round_msg.join(auto_open_msg)
+                agent.end_round_msg.join(success_msg)
     
     async def _collect_feedback_and_memory(self, round_id):
 
@@ -2663,7 +3042,7 @@ class ConversationManager:
                 message_category="system_instruction"
             )         
      
-            strategy_feedback = await agent.send_message(agent.end_message + msg)
+            strategy_feedback = await agent.send_message(agent.end_round_msg + msg)
             
             # Log response
             await self.db_manager.log_message(
@@ -2681,7 +3060,9 @@ class ConversationManager:
             memory = await self.db_manager.get_agent_memory(agent.agent_id)
             recent_experience = ""
             if memory and memory.get("experiences"):
-                recent_experience = "\nHere is a reminder how your previous memory note looks like. Please update it. \n \n" + memory["experiences"][-1]
+                last_experience = memory["experiences"][-1] 
+                learnings = last_experience.get('learnings', '')
+                recent_experience = "\nHere is a reminder how your previous memory note looks like. Please update it. \n \n" + learnings
 
 
             await self.db_manager.log_message(
@@ -2754,7 +3135,7 @@ class Container:
     
     def __init__(self, color, number, base_credit_cost):
         """Initialize a container with specified attributes"""
-        self.color = color
+        self.color = color.lower()
         self.number = number
         self.base_credit_cost = base_credit_cost
         self.is_opened = False
@@ -3194,6 +3575,35 @@ async def main():
     
     print(f"\nDatabase saved at: {db_path}")
     print("Use db_explorer.py to analyze the conversations and outcomes!")
+
+
+    # If dry run, print statistics
+    if DRY_RUN:
+        print("\n=== DRY RUN STATISTICS ===")
+        total_api_calls = 0
+        total_tokens = 0
+        total_cost = 0
+        
+        for agent in agents:
+            if hasattr(agent, 'response_generator'):
+                stats = agent.response_generator.get_stats()
+                print(f"\n{agent.get_name()}:")
+                print(f"  - API calls that would be made: {stats['api_calls']}")
+                print(f"  - Estimated tokens: {stats['estimated_tokens']}")
+                print(f"  - Estimated cost: ${stats['estimated_cost']:.4f}")
+                
+                total_api_calls += stats['api_calls']
+                total_tokens += stats['estimated_tokens']
+                total_cost += stats['estimated_cost']
+        
+        print(f"\nTOTAL ESTIMATES:")
+        print(f"  - Total API calls: {total_api_calls}")
+        print(f"  - Total tokens: {total_tokens}")
+        print(f"  - Total estimated cost: ${total_cost:.4f}")
+        print("\n[DRY RUN COMPLETE - No actual API calls were made]")
+
+    # Erase agents memory, preparing for a new round
+    await conversation_manager.erase_round_memory()
 
 # Run the main function
 if __name__ == "__main__":
