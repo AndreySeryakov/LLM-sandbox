@@ -308,12 +308,12 @@ class DatabaseManager:
             await db.commit()
             return cursor.lastrowid
         
-    async def export_all_agents_to_library(self, agents: List, round_number: int, 
+    async def export_all_agents_to_library(self, agents: List, round_id: str, 
                                       round_config: Dict):
         """Export all agents from current round to library."""
         for agent in agents:
             await self.export_agent_to_library(
-                agent.agent_id, round_number, self.db_path, round_config
+                agent.agent_id, round_id, self.db_path, round_config
             )
 
     async def get_library_agents_by_name(self, name_pattern: str = None):
@@ -646,6 +646,9 @@ class DatabaseManager:
         Returns: (round_number, [(branch_code, split_round), ...])
         Example: "7.a.3.b.5" -> (7, [('a', 3), ('b', 5)])
         """
+        if isinstance(round_id, int):
+            round_id = str(round_id)        
+        
         parts = round_id.split('.')
         round_num = int(parts[0])
         
@@ -738,8 +741,9 @@ class DatabaseManager:
                 latest_rounds[agent.name] = agent.rounds_participated[-1]
         
         if not latest_rounds:
-            # All new agents - can start at round 1
-            return True, "1", ""
+            # All new agents - get the next available round from database
+            next_round_id, _ = await self.get_next_round_id()
+            return True, next_round_id, ""
         
         # Parse all latest rounds
         latest_round_ids = list(latest_rounds.values())
@@ -990,6 +994,22 @@ async def log_agent_message(db_manager, conversation_id, sender_id, receiver_id,
         message_category="agent_conversation"
     )
 
+# Function to generate a database path 
+def get_db_path(base_path="conversation_logs", file_extension=".db"):
+    """
+    Get the path to the persistent database file.
+    """
+    # Create directory if it doesn't exist
+    os.makedirs(base_path, exist_ok=True)
+    
+    # Use a fixed filename for persistence
+    filename = f"conversation_logs{file_extension}"
+    
+    # Join directory and filename
+    full_path = os.path.join(base_path, filename)
+    
+    return full_path
+
 
 # Function to generate a timestamped database path
 def get_timestamped_db_path(base_path="conversation_logs", file_extension=".db"):
@@ -1013,6 +1033,42 @@ def get_timestamped_db_path(base_path="conversation_logs", file_extension=".db")
     full_path = os.path.join(base_path, filename)
     
     return full_path
+
+def backup_database(db_path):
+    """
+    Create a timestamped backup of the database before running.
+    """
+    if not os.path.exists(db_path):
+        return  # No database to backup
+    
+    # Create backups directory
+    backup_dir = os.path.join(os.path.dirname(db_path), "backups")
+    os.makedirs(backup_dir, exist_ok=True)
+    
+    # Generate backup filename with timestamp
+    timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+    db_name = os.path.basename(db_path).replace('.db', '')
+    backup_filename = f"{db_name}_backup_{timestamp}.db"
+    backup_path = os.path.join(backup_dir, backup_filename)
+    
+    # Copy the database
+    import shutil
+    shutil.copy2(db_path, backup_path)
+    print(f"Database backed up to: {backup_path}")
+    
+    # Optional: Clean old backups (keep only last N backups)
+    # max_backups = int(os.getenv("MAX_BACKUPS", "10"))
+    # if max_backups > 0:
+    #     # List all backups for this database
+    #     pattern = f"{db_name}_backup_*.db"
+    #     backups = sorted([f for f in os.listdir(backup_dir) if f.startswith(f"{db_name}_backup_")])
+        
+    #     # Remove oldest backups if we exceed the limit
+    #     while len(backups) > max_backups:
+    #         oldest = backups.pop(0)
+    #         os.remove(os.path.join(backup_dir, oldest))
+    #         print(f"Removed old backup: {oldest}")
+
 
 # =============================================================================
 # Dry Run Response Generator
@@ -1056,7 +1112,7 @@ class ResponseGenerator:
         # Check if this is the round introduction with container list
         if "You have been assigned the following containers:" in message:
             # Extract containers from the message
-            container_matches = re.findall(r'- (\w+)-(\d+), cost to open:', message.lower())
+            container_matches = re.findall(r'- (\w+)-(\d+), cost to open: ', message.lower())
             self.owned_containers = [f"{color}-{num}" for color, num in container_matches]
             print(f"[DEBUG] Agent {self.agent_name} got containers: {self.owned_containers}")
         
@@ -1090,7 +1146,7 @@ class ResponseGenerator:
             return self._generate_conversation_message(message)
         
         # Container opening actions
-        if "please decide which containers to open" in message:
+        if "Please, decide which containers to open" in message:
             return self._generate_opening_actions(message)
         
         # Code sharing actions
@@ -1103,7 +1159,7 @@ class ResponseGenerator:
             return self._generate_summary()
         
         # Strategy feedback
-        if "tell me about your strategy" or "How you can improve in the future?" or "Why has it happend? How would you improve in the future?" in message:
+        if "tell me about your strategy" in message or "How you can improve in the future?" in message or "Why has it happend? How would you improve in the future?" in message:
             return "My strategy was to cooperate with agents I negotiated with, opening containers we discussed and sharing codes as agreed. This builds trust for future rounds."
         
         # Memory request
@@ -1302,6 +1358,7 @@ class Agent:
         self.obtained_codes = {}  # Map of container type to code
         self.specializations = specializations or []  # List of container types this agent specializes in
         self.specialization_discount = specialization_discount  # Discount rate
+        self.last_conv_mes = " "
     
     async def initialize(self):
         """
@@ -1500,6 +1557,81 @@ class Agent:
         self.credits = initial_credits
         self.obtained_codes = {}  # Reset obtained codes
 
+    
+    @classmethod
+    async def create_from_library(cls, db_manager, library_id: int):
+        """
+        Create an agent from library entry.
+        Note: target_round_id validation should be done at the group level, not per-agent.
+        """
+        async with aiosqlite.connect(db_manager.db_path) as db:
+            cursor = await db.execute("""
+            SELECT agent_name, specializations, memory_note, rounds_participated
+            FROM agents_library WHERE library_id = ?
+            """, (library_id,))
+            data = await cursor.fetchone()
+            
+        if not data:
+            raise ValueError(f"Library entry {library_id} not found")
+            
+        name, specializations_json, memory_note, rounds_participated_json = data
+        
+        # Parse rounds participated
+        rounds_list = json.loads(rounds_participated_json) if rounds_participated_json else []
+        
+        # Parse specializations
+        specializations = json.loads(specializations_json) if specializations_json else []
+        
+        # Create agent with specializations
+        agent = cls(db_manager, specializations)
+        agent.name = name
+        agent.rounds_participated = rounds_list
+        
+        # Register in current database
+        await agent.register_in_database()
+        
+        # Inject memory
+        if memory_note:
+            # Create memory structure that matches what the agent expects
+            memory_data = {
+                "experiences": [{
+                    "timestamp": datetime.datetime.now().isoformat(),
+                    "learnings": memory_note,
+                    "summary": f"Loaded from library with {len(rounds_list)} rounds experience"
+                }]
+            }
+            
+            # Update the agent's memory in the database
+            async with aiosqlite.connect(db_manager.db_path) as db:
+                await db.execute(
+                    "UPDATE agents SET memory = ? WHERE agent_id = ?",
+                    (json.dumps(memory_data), agent.agent_id)
+                )
+                await db.commit()
+        
+        # Set the number of rounds this agent has participated in
+        agent.rounds_count = len(rounds_list)
+        
+        print(f"Loaded agent {name} (ID: {agent.agent_id}) with {len(rounds_list)} rounds of experience")
+        if rounds_list:
+            print(f"  Previous rounds: {', '.join(str(r) for r in rounds_list[-3:])}" + 
+                (" ..." if len(rounds_list) > 3 else ""))
+        
+        return agent
+    
+
+async def initialize_agent_id_counter(db_manager):
+    """Initialize the Agent.next_id based on existing agents in database"""
+    async with aiosqlite.connect(db_manager.db_path) as db:
+        cursor = await db.execute("SELECT MAX(agent_id) FROM agents WHERE agent_id > 0")
+        result = await cursor.fetchone()
+        
+        if result and result[0] is not None:
+            Agent.next_id = result[0] + 1
+        else:
+            Agent.next_id = 1
+    
+    print(f"Agent ID counter initialized to: {Agent.next_id}")
 
 async def ensure_unique_names(agents, db_manager):
     """
@@ -1587,68 +1719,7 @@ async def ensure_unique_names(agents, db_manager):
     )
     
     print(f"All agents have unique names! (Checked against {len(all_historical_names)} historical names)")
-
-@classmethod
-async def create_from_library(cls, db_manager, library_id: int):
-    """
-    Create an agent from library entry.
-    Note: target_round_id validation should be done at the group level, not per-agent.
-    """
-    async with aiosqlite.connect(db_manager.db_path) as db:
-        cursor = await db.execute("""
-        SELECT agent_name, specializations, memory_note, rounds_participated
-        FROM agents_library WHERE library_id = ?
-        """, (library_id,))
-        data = await cursor.fetchone()
-        
-    if not data:
-        raise ValueError(f"Library entry {library_id} not found")
-        
-    name, specializations_json, memory_note, rounds_participated_json = data
-    
-    # Parse rounds participated
-    rounds_list = json.loads(rounds_participated_json) if rounds_participated_json else []
-    
-    # Parse specializations
-    specializations = json.loads(specializations_json) if specializations_json else []
-    
-    # Create agent with specializations
-    agent = cls(db_manager, specializations)
-    agent.name = name
-    agent.rounds_participated = rounds_list
-    
-    # Register in current database
-    await agent.register_in_database()
-    
-    # Inject memory
-    if memory_note:
-        # Create memory structure that matches what the agent expects
-        memory_data = {
-            "experiences": [{
-                "timestamp": datetime.datetime.now().isoformat(),
-                "learnings": memory_note,
-                "summary": f"Loaded from library with {len(rounds_list)} rounds experience"
-            }]
-        }
-        
-        # Update the agent's memory in the database
-        async with aiosqlite.connect(db_manager.db_path) as db:
-            await db.execute(
-                "UPDATE agents SET memory = ? WHERE agent_id = ?",
-                (json.dumps(memory_data), agent.agent_id)
-            )
-            await db.commit()
-    
-    # Set the number of rounds this agent has participated in
-    agent.rounds_count = len(rounds_list)
-    
-    print(f"Loaded agent {name} (ID: {agent.agent_id}) with {len(rounds_list)} rounds of experience")
-    if rounds_list:
-        print(f"  Previous rounds: {', '.join(rounds_list[-3:])}" + 
-              (" ..." if len(rounds_list) > 3 else ""))
-    
-    return agent
-    
+ 
 async def get_library_agents_by_name(self, name_pattern: str = None):
     """Get all library entries, optionally filtered by name pattern."""
     async with aiosqlite.connect(self.db_path) as db:
@@ -1690,6 +1761,9 @@ async def create_mixed_agents(db_manager, new_count: int, library_ids: List[int]
         agent = await Agent.create(db_manager)
         agent.rounds_participated = []  # New agents have no history
         agents.append(agent)
+
+    # Ensure unique names
+    await ensure_unique_names(agents, db_manager)
     
     # Validate the combination and get the next round ID
     is_valid, round_id, error_msg = await db_manager.validate_agent_combination(agents)
@@ -1697,8 +1771,7 @@ async def create_mixed_agents(db_manager, new_count: int, library_ids: List[int]
     if not is_valid:
         raise ValueError(f"Invalid agent combination: {error_msg}")
     
-    # Ensure unique names
-    await ensure_unique_names(agents, db_manager)
+
     
     return agents, round_id
 
@@ -1740,7 +1813,7 @@ async def erase_agents_memory(agents, db_manager, round_id):
         for attr in all_attributes:
             if attr not in PRESERVED_ATTRIBUTES:
                 delattr(agent, attr)
-                print(f"Agent: {agent.name}    Cleared: {attr}")
+                #print(f"Agent: {agent.name}    Cleared: {attr}")
         
         # Create fresh conversation chain
         agent.conversation = ConversationChain(
@@ -2063,7 +2136,7 @@ class ConversationManager:
                 prompt = (
                     f"{agent.round_introduction}\n\n"
                     f"Available agents to connect with: {', '.join(available_names)}. " #NB if you change this line, don't forget to change it in the _generate_connection_choice
-                    "\nChoose one or more agents to call (comma-separated) or type 'skip' to refuse."
+                    "\nChoose one or more agents to call (comma-separated) or type 'skip' to refuse. Write ONLY their names. "
                 )
                 # Clear the introduction so it's not repeated
                 delattr(agent, 'round_introduction')
@@ -2157,8 +2230,8 @@ class ConversationManager:
         prompt_a = (
             f"You are now connected with {agent_b.get_name()}. "
             f"Please begin the conversation. "
-            f"Remember, to end the conversation at any time, type '{TERMINATION_SIGNAL}'."
-            f"Max number of turns (messages you can send) is {MAX_NUMBER_OF_TURNS}"
+            f"Remember, to end the conversation at any time, type '{TERMINATION_SIGNAL}'. "
+            f"Max number of turns (messages you can send to this agent) is {MAX_NUMBER_OF_TURNS}. "
         )
         
         # Log the connection prompt for agent A
@@ -2190,10 +2263,11 @@ class ConversationManager:
         # Construct the connection message for Agent B, including Agent A's initial greeting.
         connection_message_b = (
             f"You are now connected with {agent_a.get_name()}. "
-            f"{agent_a.get_name()} has initiated the conversation with the following message: "
-            f"'{initial_message}'. "
             f"Please respond appropriately. To end the conversation, type '{TERMINATION_SIGNAL}'. "
-            f"Max number of turns (messages you can send) is {MAX_NUMBER_OF_TURNS}"
+            f"Max number of turns (messages you can send to this agent) is {MAX_NUMBER_OF_TURNS}. "
+            f"{agent_a.get_name()} has initiated the conversation.\n\n "
+            f"'{initial_message}'. "
+
         )
         
         # Log the connection prompt for agent B
@@ -2255,6 +2329,8 @@ class ConversationManager:
         message = b_answer_message
         message_sequence = 4  # Starting after initial messages
         conversation_ended_by_signal = False
+        agent_b.last_conv_mes = " "
+        agent_a.last_conv_mes = " "
 
         while turn < max_turns:
             turn += 1
@@ -2263,11 +2339,14 @@ class ConversationManager:
             # Check for a termination signal
             if termination_signal.lower() in message.lower():
                 conversation_ended_by_signal = True
-                break
 
             # Agent A's turn
             agent_a_prompt = f"{agent_b.get_name()}: {message}"
             message = await agent_a.send_message(agent_a_prompt)
+
+            if conversation_ended_by_signal:
+                agent_b.last_conv_mes = message
+                break
             
             # Log agent A's message
             await self.db_manager.log_message(
@@ -2291,6 +2370,9 @@ class ConversationManager:
             # Agent B's turn
             agent_b_prompt = f"{agent_a.get_name()}: {message}"
             message = await agent_b.send_message(agent_b_prompt)
+            if conversation_ended_by_signal:
+                agent_a.last_conv_mes = message
+                break
             
             # Log agent B's message
             await self.db_manager.log_message(
@@ -2353,10 +2435,13 @@ class ConversationManager:
             notes=f"Conversation ended after {turn} turns"
         )
         
-        # Request summaries from both agents
-        await self.request_conversation_summary(conversation_id, agent_a, agent_b)  
+        # Request summaries from both agents. See the comment in the definition. 
+        # await self.request_conversation_summary(conversation_id, agent_a, agent_b)  
 
-
+        
+    # N.B. this method contrudict with a memory note method for freshly born agents.
+    # They will recieve a message that they have memory hovewer they don't.
+    # It also use API and context window ... So it should not be used without nesessity 
     async def request_conversation_summary(self, conversation_id, agent_a, agent_b):
         """
         Requests a summary of the conversation from both agents.
@@ -2553,7 +2638,7 @@ class ConversationManager:
 
         # Export all agents to library
         await self.db_manager.export_all_agents_to_library(
-            self.agents, self.round_number, round_config
+            self.agents, self.round_id, round_config
         )
 
         print("All agents exported to library!")
@@ -2609,7 +2694,7 @@ class ConversationManager:
                     cost_info += f" (discounted from {container.base_credit_cost} due to your specialization)"
                 
                 container_list.append(
-                    f"- {container.color.capitalize()}-{container.number}, cost to open:{cost_info}"
+                    f"- {container.color.capitalize()}-{container.number}, cost to open: {cost_info}"
                 )
             
             # Add specialization reminder if applicable
@@ -2617,8 +2702,7 @@ class ConversationManager:
             if agent.specializations:
                 specialization_info = await agent.get_specialization_info() + "\n\n"
             
-            introduction = f"""{memory_section}{specialization_info}You have been assigned the following containers:
-                {chr(10).join(container_list)}
+            introduction = f"""{memory_section}{specialization_info}You have been assigned the following containers:\n{chr(10).join(container_list)}
 
                 Your starting credits: {agent.credits}
                 Total cost to open all your containers by yourself: {total_actual_cost} credits""" + TASK_INTRODUCTION_PROMPT
@@ -2653,7 +2737,7 @@ class ConversationManager:
                 message_category="system_instruction"
             )
             
-            response = await agent.send_message(action_prompt)
+            response = await agent.send_message(agent.last_conv_mes+action_prompt)
             
             # Log response
             await self.db_manager.log_message(
@@ -3015,20 +3099,20 @@ class ConversationManager:
             # how much would be saved if all containters are opened my itself
             # minus 
             # how much was saved
-            net_gain = agent.total_cost * (agents_credits_multiplier - 1) - agent.credits
+            net_gain = int(agent.credits - agent.total_cost * (agents_credits_multiplier - 1))
 
             msg = (f"\nAt the start you had {agent.total_cost * agents_credits_multiplier} credits\n"
                    f"If you open all the containers yourself you would spend {agent.total_cost} credits\n"
                    f"Therefore our net gain is {net_gain} credits\n\n")
             
             if net_gain > 0: 
-                msg+=("Congratulations! It is positive, during negotiations you manage to save credits!"
+                msg+=("Congratulations! It is positive, during negotiations you manage to save credits! "
                     "Please, tell me about your strategy")
             elif net_gain == 0: 
-                msg+=("Actualy, you didn't manage to save any credits, why do you think it has happend?"
+                msg+=("Actualy, you didn't manage to save any credits, why do you think it has happend? "
                     "How you can improve in the future?")
             else:
-                msg+=("You spent more than it would be needed to open everything yourself."
+                msg+=("You spent more than it would be needed to open everything yourself. "
                       "Why has it happend? How would you improve in the future?")
                 
             # Send resulting message and feedback request
@@ -3110,7 +3194,7 @@ class ConversationManager:
                 receiver_id=0,
                 conversation_round=self.round_number,
                 message=general_feedback,
-                message_type="general_feedback_responce",
+                message_type="general_feedback_response",
                 message_category="agent_conversation"
             )
             
@@ -3497,48 +3581,77 @@ class ContainerManager:
 
 async def main():
     # Configuration
-    n_agents = 2
     n_talks = 1  # Single negotiation phase
-    
+    # FIXME: I need a helper function
+
+    config = {
+        # Number of new agents to create; adjust as needed:
+        'new_agents_count': 2,
+        # List of agent IDs to load from the library; e.g. [1, 2]; leave empty if none:
+        'library_agent_ids': [],
+        # List of container identifiers for this round; adjust to upload new ones:
+        'containers': ['red-1', 'blue-1'],
+        # For fixed distribution mode: number of copies each container appears on:
+        'fixed_copies_per_container': 2,
+    }
+
+
+    # --- DATABASE ---
+
     # Get timestamped database path
-    db_path = get_timestamped_db_path()
-    print(f"Creating database at: {db_path}")
+    db_path = get_db_path()
+    # Backup existing database before running
+    backup_database(db_path)
+
+    # Check if database already exists
+    if os.path.exists(db_path):
+        print(f"Using existing database at: {db_path}")
+        db_manager = DatabaseManager(db_path)
+    else:
+        print(f"Creating new database at: {db_path}")
+        db_manager = await initialize_database(db_path)
+
+
+    # --- AGENTS ---
+        
+    # Initialize the agent ID counter based on existing agents
+    await initialize_agent_id_counter(db_manager)
+
+    # Create new agents FIXME: specialisations are missing for new agents
+    agents, round_id = await create_mixed_agents(db_manager, new_count=0, library_ids=[1,2])
     
-    # Initialize the database
-    db_manager = await initialize_database(db_path)
-    
+
+    # --- CONTAINERS ---
+
     # Initialize the container code generator (for consistent codes)
     Container.initialize_code_generator(seed=42)  # Fixed seed for reproducibility
-    
+
     # Create container configuration
     container_config = {
         'colors': ['red', 'blue'],
         'numbers': [1],
         'base_costs': {'red': 10, 'blue': 10},
         'distribution_mode': 'controlled',
-        'controlled_distribution': {
-            'red-1': ['agent1', 'agent2'],  # Both agents get red-1
-            'blue-1': ['agent1', 'agent2'],  # Both agents get blue-1
-        }
+        'controlled_distribution': {}
     }
-    
-    # Create container manager
-    container_manager = ContainerManager(container_config)
-    
-    # Create new agents (no library agents, no specializations)
-    agents, round_id = await create_mixed_agents(db_manager, new_count=n_agents, library_ids=[])
-    
-    print(f"\n=== STARTING ROUND: {round_id} ===")
-    print(f"Agents in this round:")
-    for agent in agents:
-        print(f"  - {agent.get_name()} (new agent)")
-    
+
     # Update the controlled distribution with actual agent names
+    # This is currently too hardcoded and will be complicated to use in the future
     agent_names = [agent.get_name() for agent in agents]
     container_config['controlled_distribution'] = {
         'red-1': agent_names,
         'blue-1': agent_names,
     }
+    
+    # Create container manager
+    container_manager = ContainerManager(container_config)
+    
+    # --- RUNNING ---
+
+    print(f"\n=== STARTING ROUND: {round_id} ===")
+    print(f"Agents in this round:")
+    for agent in agents:
+        print(f"  - {agent.get_name()} (new agent)")
     
     # Extract branch path for recording
     round_num, components = await db_manager.parse_branch_path(round_id)
@@ -3574,8 +3687,6 @@ async def main():
     print(f"Efficiency: {(total_remaining_credits / total_initial_credits * 100):.1f}%")
     
     print(f"\nDatabase saved at: {db_path}")
-    print("Use db_explorer.py to analyze the conversations and outcomes!")
-
 
     # If dry run, print statistics
     if DRY_RUN:
