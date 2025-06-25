@@ -1841,17 +1841,19 @@ async def erase_agents_memory(agents, db_manager, round_id):
 # =============================================================================
 
 class ConversationManager:
-    def __init__(self, agents, db_manager, conversation_limit=3):
+    def __init__(self, agents, db_manager, conversation_limit=3, error_collector=None):
         """
         Initializes the ConversationManager.
         
         :param agents: List of agent instances.
         :param db_manager: Database manager instance.
         :param conversation_limit: Maximum number of conversations an agent can have per round.
+        :param error_collector: ErrorCollector instance for tracking issues.
         """
         self.agents = agents
         self.db_manager = db_manager
         self.conversation_limit = conversation_limit
+        self.error_collector = error_collector or ErrorCollector() 
         # Track the number of conversations per agent
         self.conversation_counts = {agent: 0 for agent in agents}
         # Set of agents that are still available to make new calls
@@ -1933,50 +1935,68 @@ class ConversationManager:
                 # If multiple candidates, prompt the agent to choose one
                 if len(candidates) > 1:
                     candidate_names = [c.get_name() for c in candidates]
-                    prompt = (
+                    base_prompt = (
                         f"You have multiple mutual connection proposals: {', '.join(candidate_names)}. "
                         "Please choose one by typing only the name."
                     )
                     
-                    # Log the selection prompt
-                    await self.db_manager.log_message(
-                        conversation_id=round_id,
-                        sender_id=0,  # System
-                        receiver_id=agent.agent_id,
-                        conversation_round=self.round_number,
-                        message=prompt,
-                        message_type="selection_prompt",
-                        message_category="system_instruction"
-                    )
-                    
-                    response = await agent.send_message(prompt)
-                    
-                    # Log the agent's response
-                    await self.db_manager.log_message(
-                        conversation_id=round_id,
-                        sender_id=agent.agent_id,
-                        receiver_id=0,  # System
-                        conversation_round=self.round_number,
-                        message=response,
-                        message_type="selection_response",
-                        message_category="agent_conversation"
-                    )
-                    
-                    chosen_name = response.strip().lower()
                     chosen_candidate = None
-                    for candidate in candidates:
-                        if candidate.get_name().lower() == chosen_name:
-                            chosen_candidate = candidate
+                    for attempt in range(2):
+                        prompt = base_prompt if attempt == 0 else base_prompt + "\n\nPlease respond with ONLY the agent's name, nothing else."
+                        
+                        # Log the selection prompt
+                        await self.db_manager.log_message(
+                            conversation_id=round_id,
+                            sender_id=0,  # System
+                            receiver_id=agent.agent_id,
+                            conversation_round=self.round_number,
+                            message=prompt,
+                            message_type="selection_prompt",
+                            message_category="system_instruction"
+                        )
+                        
+                        response = await agent.send_message(prompt)
+                        
+                        # Log the agent's response
+                        await self.db_manager.log_message(
+                            conversation_id=round_id,
+                            sender_id=agent.agent_id,
+                            receiver_id=0,  # System
+                            conversation_round=self.round_number,
+                            message=response,
+                            message_type="selection_response",
+                            message_category="agent_conversation"
+                        )
+                        
+                        # Validate response
+                        is_valid, choice, _ = FormatValidator.validate_single_choice(response, candidate_names)
+                        
+                        if is_valid:
+                            for candidate in candidates:
+                                if candidate.get_name() == choice:
+                                    chosen_candidate = candidate
+                                    break
                             break
+                        else:
+                            self.error_collector.log_format_failure(
+                                agent_name=agent.get_name(),
+                                action_type="mutual_selection",
+                                attempt_number=attempt + 1,
+                                raw_response=response,
+                                expected_format=f"One of: {', '.join(candidate_names)}"
+                            )
                             
-                    if chosen_candidate is None:
-                        # If the agent's response is invalid, default to the first candidate
-                        print("\n SOMETHING WRONG: the agent's response is invalid, default to the first candidate!\n")
-                        print("prompt: " + prompt)
-                        print("answer: " + response)
-                        chosen_candidate = candidates[0]
+                            if attempt == 1:
+                                # Default to first candidate
+                                chosen_candidate = candidates[0]
+                                self.error_collector.log_warning(
+                                    f"Using default first candidate after format failures",
+                                    agent_name=agent.get_name(),
+                                    context="mutual_selection"
+                                )
                 else:
                     chosen_candidate = candidates[0]
+
                     
                 mutual_pairs.append((agent, chosen_candidate))
                 processed_agents.add(agent)
@@ -2004,53 +2024,78 @@ class ConversationManager:
                     continue
                     
                 caller_names = [caller.get_name() for caller in callers]
-                prompt = (
+                base_prompt = (
                     "Unfortunately, nobody answered your calls, however "
                     f"you have incoming call proposals from: {', '.join(caller_names)}. "
                     "Please choose one to connect with or type 'skip' to refuse."
                 )
                 
-                # Log the prompt
-                await self.db_manager.log_message(
-                    conversation_id=round_id,
-                    sender_id=0,  # System
-                    receiver_id=target.agent_id,
-                    conversation_round=self.round_number,
-                    message=prompt,
-                    message_type="call_selection",
-                    message_category="system_instruction"
-                )
-                
-                response = await target.send_message(prompt)
-                
-                # Log the response
-                await self.db_manager.log_message(
-                    conversation_id=round_id,
-                    sender_id=target.agent_id,
-                    receiver_id=0,  # System
-                    conversation_round=self.round_number,
-                    message=response,
-                    message_type="call_response",
-                    message_category="agent_conversation"
-                )
-                
-                chosen_name = response.strip().lower()
-                if chosen_name == 'skip':
-                    processed_agents.add(target)
-                    continue
-                    
                 chosen_caller = None
-                for caller in callers:
-                    if caller.get_name().lower() == chosen_name:
-                        chosen_caller = caller
-                        break
-                        
-                if chosen_caller is None:
-                    chosen_caller = callers[0]
+                for attempt in range(2):
+                    prompt = base_prompt if attempt == 0 else base_prompt + "\n\nPlease respond with ONLY an agent name or 'skip'."
                     
-                mutual_pairs.append((chosen_caller, target))
-                processed_agents.add(target)
-                processed_agents.add(chosen_caller)
+                    # Log the prompt
+                    await self.db_manager.log_message(
+                        conversation_id=round_id,
+                        sender_id=0,  # System
+                        receiver_id=target.agent_id,
+                        conversation_round=self.round_number,
+                        message=prompt,
+                        message_type="call_selection",
+                        message_category="system_instruction"
+                    )
+                    
+                    response = await target.send_message(prompt)
+                    
+                    # Log the response
+                    await self.db_manager.log_message(
+                        conversation_id=round_id,
+                        sender_id=target.agent_id,
+                        receiver_id=0,  # System
+                        conversation_round=self.round_number,
+                        message=response,
+                        message_type="call_response",
+                        message_category="agent_conversation"
+                    )
+                    
+                    # Validate response
+                    is_valid, choice, error_msg = FormatValidator.validate_single_choice(
+                        response, caller_names, allow_skip=True
+                    )
+                    
+                    if is_valid:
+                        if choice == 'skip':
+                            processed_agents.add(target)
+                            break
+                        
+                        for caller in callers:
+                            if caller.get_name() == choice:
+                                chosen_caller = caller
+                                break
+                        break
+                    else:
+                        self.error_collector.log_format_failure(
+                            agent_name=target.get_name(),
+                            action_type="incoming_call_response",
+                            attempt_number=attempt + 1,
+                            raw_response=response,
+                            expected_format=f"One of: {', '.join(caller_names)} or 'skip'"
+                        )
+                        
+                        if attempt == 1:
+                            # Default to skip
+                            processed_agents.add(target)
+                            self.error_collector.log_warning(
+                                "Defaulting to 'skip' after format failures",
+                                agent_name=target.get_name(),
+                                context="incoming_call_response"
+                            )
+                            break
+                
+                if chosen_caller:
+                    mutual_pairs.append((chosen_caller, target))
+                    processed_agents.add(target)
+                    processed_agents.add(chosen_caller)
 
             # If no mutual calls are formed, end the round.
             if not mutual_pairs:
@@ -2156,57 +2201,80 @@ class ConversationManager:
             
             print(f"Asking {agent.name} to choose")
             print("prompt: " + prompt)
-            
-            # Log the choice prompt
-            await self.db_manager.log_message(
-                conversation_id=round_id,
-                sender_id=0,  # System
-                receiver_id=agent.agent_id,
-                conversation_round=self.round_number,
-                message=prompt,
-                message_type="choice_prompt",
-                message_category="system_instruction"
-            )
-            
-            response = await agent.send_message(prompt)
-            
-            # Log the agent's response
-            await self.db_manager.log_message(
-                conversation_id=round_id,
-                sender_id=agent.agent_id,
-                receiver_id=0,  # System
-                conversation_round=self.round_number,
-                message=response,
-                message_type="choice_response",
-                message_category="agent_conversation"
-            )
-            
-            print("response: " + response)
 
-            cleaned_response = response.strip().lower()
-            if cleaned_response == 'skip':
-                return (agent, None)
-                
-            # Assume the agent can provide a comma-separated list of names
-            selected_names = [name.strip() for name in cleaned_response.split(',') if name.strip()]
-            choices = []
-            for a in self.available_agents:
-                if a != agent and a.get_name().lower() in [name.lower() for name in selected_names]:
-                    choices.append(a)
-                    
-            if choices:
-                return (agent, choices)
-            else:
-                # If no valid agent is found, treat as a skip
-                print("\nSomething wrong with an agent choosing another agents\n"
-                      "prompt: " + prompt +
-                      "\nanswer: " + response +
-                      "\n"
+            # Try twice to get valid format
+            for attempt in range(2):
+                # Log the choice prompt
+                await self.db_manager.log_message(
+                    conversation_id=round_id,
+                    sender_id=0,  # System
+                    receiver_id=agent.agent_id,
+                    conversation_round=self.round_number,
+                    message=prompt if attempt == 0 else prompt + "\n\nPlease use the exact format: comma-separated agent names or 'skip'",
+                    message_type="choice_prompt",
+                    message_category="system_instruction"
                 )
-                # Treat as skip (for now)
-                return (agent, None) 
+                
+                response = await agent.send_message(prompt if attempt == 0 else prompt + "\n\nPlease use the exact format: comma-separated agent names or 'skip'")
+                
+                # Log the agent's response
+                await self.db_manager.log_message(
+                    conversation_id=round_id,
+                    sender_id=agent.agent_id,
+                    receiver_id=0,  # System
+                    conversation_round=self.round_number,
+                    message=response,
+                    message_type="choice_response",
+                    message_category="agent_conversation"
+                )
+                
+                print("response: " + response)
+                
+                # Validate the response
+                is_valid, choices, error_msg, invalid_names = FormatValidator.validate_connection_choice(response, available_names)
+                
+                # Log any invalid names as warnings
+                if invalid_names:
+                    self.error_collector.log_warning(
+                        f"Agent tried to connect with non-existent agents: {invalid_names}",
+                        agent_name=agent.get_name(),
+                        context="connection_choice"
+                    )
+                
+                if is_valid:
+                    if choices is None:  # 'skip' was chosen
+                        return (agent, None)
+                    
+                    # Convert names back to agent objects
+                    agent_objects = []
+                    for a in self.available_agents:
+                        if a != agent and a.get_name() in choices:
+                            agent_objects.append(a)
+                    
+                    return (agent, agent_objects) if agent_objects else (agent, None)
+                else:
+                    # Log format failure
+                    self.error_collector.log_format_failure(
+                        agent_name=agent.get_name(),
+                        action_type="connection_choice",
+                        attempt_number=attempt + 1,
+                        raw_response=response,
+                        expected_format="comma-separated names or 'skip'"
+                    )
+                    
+                    if attempt == 0:
+                        print(f"Format error: {error_msg}. Retrying...")
+                    else:
+                        print(f"Format error persists: {error_msg}. Treating as skip.")
+                        return (agent, None)            
+                    
         except Exception as e:
             print(f"Error obtaining choice from {agent.get_name()}: {e}")
+            self.error_collector.log_error(
+                f"Error obtaining choice: {str(e)}",
+                agent_name=agent.get_name(),
+                context="connection_choice"
+            )
             return (agent, None)
 
     async def _connect_agents(self, conversation_id, agent_a, agent_b):
@@ -2608,8 +2676,8 @@ class ConversationManager:
         # Phase 4: Action Phase
         # Phase 4: Action Phase - Opening
         print("\nPhase 4a: Collecting opening actions...")
-        opening_actions = await self._collect_opening_actions(round_id, container_manager)
-        codes_obtained = await self._process_openings(round_id, opening_actions, container_manager)
+        opening_actions, invalid_containers = await self._collect_opening_actions(round_id, container_manager)
+        codes_obtained = await self._process_openings(round_id, opening_actions, invalid_containers, container_manager)
 
         # Phase 4b: Action Phase - Sharing  
         print("\nPhase 4b: Collecting sharing actions...")
@@ -2722,89 +2790,150 @@ class ConversationManager:
     async def _collect_opening_actions(self, round_id, container_manager):
         """Collect opening actions from all agents."""
         opening_actions = {} # agent_id -> list of container identifiers to open
+        invalid_containers = {} # agent_id -> list of invalid container identifiers
         
-        action_prompt = COLLECT_OPENING_ACTIONS_PROMPT
+        base_prompt = COLLECT_OPENING_ACTIONS_PROMPT
         
         for agent in self.agents:
-            # Send action prompt
-            await self.db_manager.log_message(
-                conversation_id=round_id,
-                sender_id=0,
-                receiver_id=agent.agent_id,
-                conversation_round=self.round_number,
-                message=action_prompt,
-                message_type="opening_action_request",
-                message_category="system_instruction"
-            )
-            
-            response = await agent.send_message(agent.last_conv_mes+action_prompt)
-            
-            # Log response
-            await self.db_manager.log_message(
-                conversation_id=round_id,
-                sender_id=agent.agent_id,
-                receiver_id=0,
-                conversation_round=self.round_number,
-                message=response,
-                message_type="opening_action_response",
-                message_category="agent_conversation"
-            )
-            
-            # Parse actions (simplified - you may want more robust parsing)
-            opening_actions[agent.agent_id] = []
-            
-            lines = response.strip().split('\n')
-            found_open_section = False
-            
-            for line in lines:
-                line = line.strip()
-                if line == "OPEN:":
-                    found_open_section = True
-                    continue
-                elif found_open_section and line:
-                    # Check if it's a valid container identifier
-                    line = line.lower()
-                    if line in container_manager.container_registry:
-                        opening_actions[agent.agent_id].append(line)
-                    else:
-                        # If it's not a valid container, log a warning but continue
-                        print(f"Warning: Agent {agent.get_name()} tried to open invalid container: {line}")
 
+            valid_containers = list(container_manager.container_registry.keys())
+            actions_confirmed = False
+
+            for attempt in range(2):
+                action_prompt = base_prompt if attempt == 0 else "\n\nIMPORTANT: You must start with 'OPEN:' on its own line, then list containers."
+                
+
+
+                # Send action prompt
+                await self.db_manager.log_message(
+                    conversation_id=round_id,
+                    sender_id=0,
+                    receiver_id=agent.agent_id,
+                    conversation_round=self.round_number,
+                    message=action_prompt,
+                    message_type="opening_action_request",
+                    message_category="system_instruction"
+                )
+                
+                response = await agent.send_message(agent.last_conv_mes + action_prompt)
+                
+                # Log response
+                await self.db_manager.log_message(
+                    conversation_id=round_id,
+                    sender_id=agent.agent_id,
+                    receiver_id=0,
+                    conversation_round=self.round_number,
+                    message=response,
+                    message_type="opening_action_response",
+                    message_category="agent_conversation"
+                )
+
+                # Validate format
+                is_valid, valid_selections, error_msg, invalid_selections = FormatValidator.validate_container_opening(response, valid_containers)
+                
+                if not is_valid:
+                    self.error_collector.log_format_failure(
+                        agent_name=agent.get_name(),
+                        action_type="container_opening",
+                        attempt_number=attempt + 1,
+                        raw_response=response,
+                        expected_format="OPEN: followed by container IDs"
+                    )
+                    
+                    if attempt == 1:
+                        opening_actions[agent.agent_id] = []
+                        invalid_containers[agent.agent_id] = []
+                        self.error_collector.log_warning(
+                            "No containers opened due to format errors",
+                            agent_name=agent.get_name(),
+                            context="container_opening"
+                        )
+                    continue
+
+                # Check if we have invalid containers and no valid ones on first attempt
+                if invalid_selections and not valid_selections and attempt == 0:
+                    # All containers invalid - give second chance
+                    self.error_collector.log_warning(
+                        f"All containers invalid: {invalid_selections}",
+                        agent_name=agent.get_name(),
+                        context="container_opening"
+                    )
+                    
+                    await self.db_manager.log_message(
+                        conversation_id=round_id,
+                        sender_id=0,
+                        receiver_id=agent.agent_id,
+                        conversation_round=self.round_number,
+                        message=f"ERROR: The following containers do not exist: {invalid_selections}.",
+                        message_type="opening_error",
+                        message_category="system_instruction"
+                    )
+                    continue
+
+                # Store both valid and invalid containers
+                opening_actions[agent.agent_id] = valid_selections
+                invalid_containers[agent.agent_id] = invalid_selections
+                actions_confirmed = True
+                
+                if invalid_selections:
+                    self.error_collector.log_warning(
+                        f"Attempted to open non-existent containers: {invalid_selections}",
+                        agent_name=agent.get_name(),
+                        context="container_opening"
+                    )
+                
+                break
+                
+            if not actions_confirmed:
+                opening_actions[agent.agent_id] = []
+                invalid_containers[agent.agent_id] = []
+                
             print(f"Agent {agent.get_name()} will open: {opening_actions[agent.agent_id]}")
+            if invalid_containers[agent.agent_id]:
+                print(f"  (Invalid containers ignored: {invalid_containers[agent.agent_id]})")
         
-        return opening_actions
+        return opening_actions, invalid_containers
+  
     
-    async def _process_openings(self, round_id, opening_actions, container_manager):
+    async def _process_openings(self, round_id, opening_actions, invalid_containers, container_manager):        
         """Process all container openings and return the codes obtained."""
         codes_obtained = {}  # agent_id -> dict of container_id -> code
         
         for agent in self.agents:
             codes_obtained[agent.agent_id] = {}
             agent_opens = opening_actions.get(agent.agent_id, [])
+            agent_invalid = invalid_containers.get(agent.agent_id, [])
             opening_msg = "No"
 
-            if agent_opens:
-                opening_msg = f"Opening {len(agent_opens)} containers:\n"
+            if agent_opens or agent_invalid:
+
+                opening_msg = ""
+            
+                if agent_invalid:
+                    opening_msg = f"WARNING: The following containers do not exist and were ignored: {agent_invalid}\n\n"
+            
+                if agent_opens:
+                    opening_msg += f"Opening {len(agent_opens)} containers:\n"
                 
-                for container_id in agent_opens:
-                    if container_id in container_manager.container_registry:
-                        container = container_manager.container_registry[container_id]
-                        message, code = container.open(agent)
-                        codes_obtained[agent.agent_id][container_id] = code
-                        opening_msg += f"- {container_id}: {message}\n"
-                        
-                        # Log individual opening
-                        await self.db_manager.log_message(
-                            conversation_id=round_id,
-                            sender_id=agent.agent_id,
-                            receiver_id=0,
-                            conversation_round=self.round_number,
-                            message=f"Opened container {container_id}: {message}",
-                            message_type="container_opened",
-                            message_category="agent_conversation"
-                        )
-                    else:
-                        opening_msg += f"- {container_id}: ERROR - Container not found\n"
+                    for container_id in agent_opens:
+                        if container_id in container_manager.container_registry:
+                            container = container_manager.container_registry[container_id]
+                            message, code = container.open(agent)
+                            codes_obtained[agent.agent_id][container_id] = code
+                            opening_msg += f"- {container_id}: {message}\n"
+                            
+                            # Log individual opening
+                            await self.db_manager.log_message(
+                                conversation_id=round_id,
+                                sender_id=agent.agent_id,
+                                receiver_id=0,
+                                conversation_round=self.round_number,
+                                message=f"Opened container {container_id}: {message}",
+                                message_type="container_opened",
+                                message_category="agent_conversation"
+                            )
+                        else:
+                            opening_msg += f"- {container_id}: ERROR - Container not found\n"
                 
                 # Send summary to agent
                 await self.db_manager.log_message(
@@ -2836,6 +2965,9 @@ class ConversationManager:
 
             share_prompt += SHARING_ACTIONS_PROMPT
                 
+            # We don't check if the output is correct for sharing
+            # as it can be a deception
+
             # Log the sharing request
             await self.db_manager.log_message(
                 conversation_id=round_id,
@@ -2861,64 +2993,70 @@ class ConversationManager:
                 message_category="agent_conversation"
             )
             
-            # Parse sharing actions
-            lines = response.strip().split('\n')
-            in_share_section = False
+            # Validate format
+            is_valid, shares, error_msg = FormatValidator.validate_code_sharing(response)
             
             sharing_actions[agent.agent_id] = []
+
+            if error_msg:
+                self.error_collector.log_format_failure(
+                    agent_name=agent.get_name(),
+                    action_type="code_sharing",
+                    attempt_number=1,
+                    raw_response=response,
+                    expected_format="SHARE: followed by 'recipient | container | code'"
+                )
             
-            for line in lines:
-                line = line.strip()
-                if line.startswith("SHARE:"):
-                    in_share_section = True
-                    continue
+            if not is_valid:
+                continue
+
+            for recipient_name, container_id, provided_code in shares:
+                # Check the nature of the share
+                share_type = "unknown"
+                warning_msg = None
                 
-                if in_share_section and line and '|' in line:
-                    parts = [p.strip() for p in line.split('|')]
-                    if len(parts) == 3:
-                        recipient_name, container_id, provided_code = parts
-                        
-                        # Check the nature of the share
-                        share_type = "unknown"
-                        warning_msg = None
-                        
-                        # Check if container exists
-                        if container_id in container_manager.container_registry:
-                            actual_code = container_manager.container_registry[container_id].code
-                            
-                            if provided_code == actual_code:
-                                # Correct code
-                                if container_id in codes_obtained.get(agent.agent_id, {}):
-                                    share_type = "correct_just_opened"
-                                else:
-                                    share_type = "correct_from_memory"
-                                    warning_msg = f"WARNING: Agent {agent.get_name()} shared correct code for {container_id} from memory (not just opened)"
-                            else:
-                                # Wrong code - deception
-                                share_type = "deception"
-                                warning_msg = f"WARNING: Agent {agent.get_name()} shared WRONG code for {container_id}: {provided_code} (actual: {actual_code})"
+                # Check if container exists
+                if container_id in container_manager.container_registry:
+                    actual_code = container_manager.container_registry[container_id].code
+                    
+                    if provided_code == actual_code:
+                        # Correct code
+                        if container_id in codes_obtained.get(agent.agent_id, {}):
+                            share_type = "correct_just_opened"
                         else:
-                            share_type = "invalid_container"
-                            warning_msg = f"WARNING: Agent {agent.get_name()} tried to share code for non-existent container {container_id}"
-                        
-                        # Log the share attempt with its type
-                        await self.db_manager.log_message(
-                            conversation_id=round_id,
-                            sender_id=agent.agent_id,
-                            receiver_id=0,
-                            conversation_round=self.round_number,
-                            message=f"Share attempt - Type: {share_type}, To: {recipient_name}, Container: {container_id}, Code: {provided_code}",
-                            message_type="share_analysis",
-                            message_category="system_feedback"
+                            share_type = "correct_from_memory"
+                            warning_msg = f"Agent {agent.get_name()} shared correct code for {container_id} from memory (not just opened)"
+                            self.error_collector.log_warning(warning_msg, agent_name=agent.get_name())
+                    else:
+                        # Wrong code - deception
+                        share_type = "deception"
+                        self.error_collector.log_deception(
+                            agent_name=agent.get_name(),
+                            action_type="wrong_code",
+                            details=f"Shared wrong code for {container_id}: {provided_code} (actual: {actual_code})"
                         )
-                        
-                        # Print warning if needed
-                        if warning_msg:
-                            print(warning_msg)
-                        
-                        # Add to sharing actions (allow all shares, even deceptive ones)
-                        sharing_actions[agent.agent_id].append((recipient_name, container_id, provided_code))
-        
+                else:
+                    share_type = "invalid_container"
+                    self.error_collector.log_deception(
+                        agent_name=agent.get_name(),
+                        action_type="fake_container",
+                        details=f"Shared code for non-existent container {container_id}"
+                    )
+                
+                # Log the share attempt with its type
+                await self.db_manager.log_message(
+                    conversation_id=round_id,
+                    sender_id=agent.agent_id,
+                    receiver_id=0,
+                    conversation_round=self.round_number,
+                    message=f"Share attempt - Type: {share_type}, To: {recipient_name}, Container: {container_id}, Code: {provided_code}",
+                    message_type="share_analysis",
+                    message_category="system_feedback"
+                )
+                
+                # Add to sharing actions (allow all shares, even deceptive ones)
+                sharing_actions[agent.agent_id].append((recipient_name, container_id, provided_code))
+
         return sharing_actions
         
     
@@ -2998,7 +3136,7 @@ class ConversationManager:
             if received_shares:
                 # — interpolate every share into a neat bullet list
                 codes_block = "\n".join(
-                    f"- {share['container']}: {share['code']} ({'valid' if share['valid'] else 'WARNING: invalid code'})"
+                    f"- {share['container']}: {share['code']} ({'valid' if share['valid'] else 'WARNING: invalid code'}) from {share['sender']}"
                     for share in received_shares
                 )
                 verification_message = (
@@ -3575,6 +3713,265 @@ class ContainerManager:
         return summary
 
 # =============================================================================
+# Error Collection System
+# =============================================================================
+
+class ErrorCollector:
+    """Collects errors, warnings, and format failures throughout the system."""
+    
+    def __init__(self):
+        self.format_failures = []
+        self.warnings = []
+        self.errors = []
+        self.deception_attempts = []
+        
+    def log_format_failure(self, agent_name, action_type, attempt_number, raw_response, expected_format=None):
+        """Log a format validation failure."""
+        entry = {
+            'timestamp': datetime.datetime.now().isoformat(),
+            'agent_name': agent_name,
+            'action_type': action_type,
+            'attempt': attempt_number,
+            'raw_response': raw_response[:200],  # Truncate long responses
+            'expected_format': expected_format,
+        }
+        self.format_failures.append(entry)
+        
+    def log_warning(self, message, agent_name=None, context=None):
+        """Log a general warning."""
+        entry = {
+            'timestamp': datetime.datetime.now().isoformat(),
+            'message': message,
+            'agent_name': agent_name,
+            'context': context
+        }
+        self.warnings.append(entry)
+        
+    def log_error(self, message, agent_name=None, context=None):
+        """Log an error."""
+        entry = {
+            'timestamp': datetime.datetime.now().isoformat(),
+            'message': message,
+            'agent_name': agent_name,
+            'context': context
+        }
+        self.errors.append(entry)
+        
+    def log_deception(self, agent_name, action_type, details):
+        """Log potential deceptive behavior."""
+        entry = {
+            'timestamp': datetime.datetime.now().isoformat(),
+            'agent_name': agent_name,
+            'action_type': action_type,
+            'details': details
+        }
+        self.deception_attempts.append(entry)
+        
+    def clear(self):
+        """Clear all collected errors and warnings."""
+        self.format_failures = []
+        self.warnings = []
+        self.errors = []
+        self.deception_attempts = []
+        
+    def get_summary(self):
+        """Get a formatted summary of all issues."""
+        lines = ["\n=== ERROR COLLECTION SUMMARY ==="]
+        
+        if self.errors:
+            lines.append(f"\nERRORS ({len(self.errors)}):")
+            for err in self.errors:
+                lines.append(f"  - [{err['timestamp']}] {err['agent_name'] or 'System'}: {err['message']}")
+                
+        if self.warnings:
+            lines.append(f"\nWARNINGS ({len(self.warnings)}):")
+            for warn in self.warnings:
+                lines.append(f"  - [{warn['timestamp']}] {warn['agent_name'] or 'System'}: {warn['message']}")
+                
+        if self.format_failures:
+            lines.append(f"\nFORMAT FAILURES ({len(self.format_failures)}):")
+            # Group by agent
+            by_agent = {}
+            for fail in self.format_failures:
+                agent = fail['agent_name']
+                if agent not in by_agent:
+                    by_agent[agent] = []
+                by_agent[agent].append(fail)
+            
+            for agent, failures in by_agent.items():
+                lines.append(f"  {agent}: {len(failures)} failures")
+                for fail in failures[:3]:  # Show first 3
+                    lines.append(f"    - {fail['action_type']} (attempt {fail['attempt']}): {fail['raw_response'][:50]}...")
+                if len(failures) > 3:
+                    lines.append(f"    ... and {len(failures) - 3} more")
+                    
+        if self.deception_attempts:
+            lines.append(f"\nPOTENTIAL DECEPTION ({len(self.deception_attempts)}):")
+            for dec in self.deception_attempts:
+                lines.append(f"  - {dec['agent_name']}: {dec['action_type']} - {dec['details']}")
+                
+        if not any([self.errors, self.warnings, self.format_failures, self.deception_attempts]):
+            lines.append("\nNo issues detected!")
+            
+        lines.append("\n================================\n")
+        return "\n".join(lines)
+    
+
+# =============================================================================
+# Format Validation Utilities
+# =============================================================================
+
+class FormatValidator:
+    """Validates and parses various response formats from agents."""
+    
+    @staticmethod
+    def validate_agent_name(response):
+        """
+        Validate agent name format (only letters).
+        Returns: (is_valid, cleaned_name, error_message)
+        """
+        if not response or not response.strip():
+            return False, None, "Empty response"
+            
+        # Extract first token from first line
+        first_line = response.strip().splitlines()[0]
+        tokens = first_line.split()
+        
+        if not tokens:
+            return False, None, "No tokens found in response"
+            
+        first_token = tokens[0]
+        cleaned = clean_name(first_token)
+        
+        if not cleaned:
+            return False, None, f"Name '{first_token}' contains no valid letters"
+            
+        return True, cleaned, None
+    
+    @staticmethod
+    def validate_connection_choice(response, available_names):
+        """
+        Validate connection choice format (comma-separated names or 'skip').
+        Returns: (is_valid, chosen_names_list, error_message, invalid_names)
+        """
+        cleaned = response.strip().lower()
+        
+        if cleaned == 'skip':
+            return True, None, None, []
+            
+        # Try to parse comma-separated names
+        potential_names = [name.strip() for name in cleaned.split(',') if name.strip()]
+        
+        if not potential_names:
+            return False, None, "No valid names found in response", []
+            
+        # Check if names match available agents (case-insensitive)
+        available_lower = [name.lower() for name in available_names]
+        valid_choices = []
+        invalid_names = []
+        
+        for name in potential_names:
+            if name in available_lower:
+                # Find original case version
+                idx = available_lower.index(name)
+                valid_choices.append(available_names[idx])
+            else:
+                invalid_names.append(name)
+        
+        if valid_choices:
+            # Even if we have valid choices, we return invalid names for warning
+            return True, valid_choices, None, invalid_names
+        else:
+            return False, None, f"No valid agent names found. Got: {potential_names}", invalid_names
+    
+    @staticmethod
+    def validate_single_choice(response, valid_options, allow_skip=False):
+        """
+        Validate single choice from options.
+        Returns: (is_valid, choice, error_message)
+        """
+        cleaned = response.strip().lower()
+        
+        if allow_skip and cleaned == 'skip':
+            return True, 'skip', None
+            
+        # Check against valid options (case-insensitive)
+        options_lower = [opt.lower() for opt in valid_options]
+        
+        if cleaned in options_lower:
+            idx = options_lower.index(cleaned)
+            return True, valid_options[idx], None
+            
+        # Check if response contains one of the options
+        for i, opt in enumerate(options_lower):
+            if opt in cleaned:
+                return True, valid_options[i], None
+                
+        return False, None, f"Response '{response}' not in valid options: {valid_options}"
+    
+    @staticmethod
+    def validate_container_opening(response, valid_containers):
+        """
+        Validate container opening format.
+        Returns: (is_valid, containers_to_open, error_message)
+        """
+        lines = response.strip().split('\n')
+        
+        if not lines or lines[0].strip().upper() != "OPEN:":
+            return False, None, "Response must start with 'OPEN:'"
+            
+        containers = []
+        for line in lines[1:]:
+            line = line.strip().lower()
+            if line:
+                containers.append(line)
+                
+
+        valid = [c for c in containers if c in valid_containers]
+        invalid = [c for c in containers if c not in valid_containers]
+        
+        if valid:  # At least one valid container
+            return True, valid, None, invalid
+        elif containers:  # All containers are invalid
+            return True, [], f"All containers invalid: {invalid}", invalid
+        else:  # No containers listed
+            return True, [], None, []
+            
+    @staticmethod
+    def validate_code_sharing(response):
+        """
+        Validate code sharing format.
+        Returns: (is_valid, shares_list, error_message)
+        shares_list = [(recipient, container, code), ...]
+        """
+        lines = response.strip().split('\n')
+        
+        if not lines or not lines[0].strip().upper().startswith("SHARE:"):
+            return False, None, "Response must start with 'SHARE:'"
+            
+        shares = []
+        error_message = ""
+        
+        for line in lines[1:]:
+            line = line.strip()
+            if not line:
+                continue
+                
+            parts = [p.strip() for p in line.split('|')]
+            if len(parts) != 3:
+                error_message+=f"Invalid share format: '{line}' (need 3 parts separated by |)\n"
+                continue                
+            recipient, container, code = parts
+            shares.append((recipient, container.lower(), code))
+            
+        if shares :
+            return True, shares, error_message
+        elif error_message :
+            return False, None, error_message
+        else: 
+            return True, None, None
+
+# =============================================================================
 # Main async function: Initializes agents, obtains decisions concurrently,
 # starts conversations concurrently, and logs all interactions.
 # =============================================================================
@@ -3616,6 +4013,9 @@ async def main():
         
     # Initialize the agent ID counter based on existing agents
     await initialize_agent_id_counter(db_manager)
+
+    # Initialize error collector
+    error_collector = ErrorCollector()
 
     # Create new agents FIXME: specialisations are missing for new agents
     agents, round_id = await create_mixed_agents(db_manager, new_count=0, library_ids=[1,2])
@@ -3661,7 +4061,7 @@ async def main():
     await db_manager.record_round(round_id, db_path, branch_path)
     
     # Create conversation manager
-    conversation_manager = ConversationManager(agents, db_manager, n_talks)
+    conversation_manager = ConversationManager(agents, db_manager, n_talks, error_collector)
     
     # Run the economic round
     await conversation_manager.run_economic_round(container_manager, container_config, round_id)
@@ -3687,6 +4087,8 @@ async def main():
     print(f"Efficiency: {(total_remaining_credits / total_initial_credits * 100):.1f}%")
     
     print(f"\nDatabase saved at: {db_path}")
+
+    print(error_collector.get_summary())
 
     # If dry run, print statistics
     if DRY_RUN:
