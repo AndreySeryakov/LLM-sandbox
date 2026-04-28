@@ -2,7 +2,7 @@
 
 A multi-agent simulation framework for studying whether **social norms and cooperation can emerge spontaneously among LLM agents** placed under economic pressure.
 
-> **Status — research code.** Active prototype, single-developer. The economic game runs end-to-end, the SQLite logging is comprehensive, and an interactive analysis CLI is included. Some pieces are still rough — see [Roadmap](#roadmap) below. Used by two mentee groups in the Monoid fellowship and by my own experiments. Contact: **seryakov.na61@gmail.com** or Telegram **@andrey_seryakov**.
+> **Status — research code.** Active prototype, single-developer. The economic game runs end-to-end, the SQLite logging is comprehensive, and an interactive analysis CLI is included. Some pieces are still rough — see [Roadmap](#roadmap) below. Contact: **a.u.seryakov@gmail.com** or Telegram **@andrey_seryakov**.
 
 This work backs the research thesis described in [*Emergent AI Society: Tasks, Scarcity, Talks*](https://www.lesswrong.com/posts/FScgtna9Bt7kgLWLu/emergent-ai-society-tasks-scarcity-talks) (LessWrong, 2025) — that AI agents optimising for task completion and resource efficiency may develop social structure (cooperation, trust, norms) without consciousness or human design.
 
@@ -12,8 +12,8 @@ This work backs the research thesis described in [*Emergent AI Society: Tasks, S
 
 Agents are placed in a resource-constrained economy and given **no instructions about cooperation, trust, or norms**. The only structural fact they know is: containers of the same colour-and-number share the same code across agents — so codes can, in principle, be shared.
 
-- **Containers.** Each agent receives a hand of containers of different colours, each carrying a hidden numeric code.
-- **Credits.** Each agent starts with credits equal to **120%** of the cost to open all their containers alone — a 20% margin that can only be captured through cooperation.
+- **Containers.** Each agent receives a hand of containers of different colours and numbers, each carrying a hidden numeric code.
+- **Credits.** Each agent starts with credits equal to **120%** of the cost to open all their containers alone. A 20% margin is added for flexibility.
 - **Shared codes.** Same colour + number → same code, across all agents. Agents who open a container can share its code with others.
 - **Cost to open.** Spending credits reveals a code. Specialisation reduces cost for specific colours.
 - **Communication.** Agents may negotiate to connect with each other (mutual choice required), exchange codes, deceive, or refuse.
@@ -68,7 +68,7 @@ Menu options: list rounds, view round details, agent participation, memory notes
 
 ```bash
 API_KEY=your_deepseek_api_key
-TEMPERATURE=2.0          # LLM sampling temperature
+TEMPERATURE=1.0          # LLM sampling temperature
 DRY_RUN=false            # true → run the pipeline without API calls
 
 # System prompts — see code for current defaults.
@@ -129,7 +129,7 @@ Every action, message, decision, and outcome is logged. Replays and post-hoc ana
 
 ## Roadmap
 
-Honest list of what's not done and what comes next.
+List of what's not done and what comes next.
 
 **Currently rough:**
 - The simulation lives in one ~4k-line file; the in-progress split into `agents.py` / `containers.py` / `conversation.py` / `database.py` / `simulation.py` is parked on the `wip-refactor` branch.
@@ -160,7 +160,7 @@ If you use the platform in research, please cite the essay above and link to thi
 
 ## Contact
 
-- **Email:** seryakov.na61@gmail.com
-- **Telegram:** @andrey_seryakov (preferred)
+- **Email:** a.u.seryakov@gmail.com
+- **Telegram:** @andrey_seryakov
 
 Questions, collaboration ideas, and mentee/contributor enquiries are all welcome.
