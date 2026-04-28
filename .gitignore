@@ -1,2 +1,8 @@
 .env
 conversation_logs/
+conversation_logs/backups/
+check_db.py
+simple_check.py
+agent_message_logs/
+memory_notes/
+.DS_Store
