@@ -1,0 +1,15 @@
+# Core LLM stack
+langchain
+langchain-core
+langchain-deepseek
+
+# Async + DB
+aiosqlite
+
+# Environment
+python-dotenv
+
+# CLI / display
+rich
+colorama
+tabulate
