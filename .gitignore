@@ -6,3 +6,5 @@ simple_check.py
 agent_message_logs/
 memory_notes/
 .DS_Store
+.venv/
+__pycache__/

@@ -1141,13 +1141,17 @@ class ResponseGenerator:
         if "You are now connected with" in message:
             return self._generate_conversation_message(message, is_initial=True)
         
-        #FIXME
-        if any(name in message for name in ["Charlie", "Diana", "Eve", "Frank", "Grace", "Henry", "Iris", "Jack"]):
+        # Conversation turn from a partner agent: starts with "Name: "
+        if re.match(r"^\s*\w+:\s", message):
             return self._generate_conversation_message(message)
-        
+
         # Container opening actions
-        if "Please, decide which containers to open" in message:
+        if "Please decide which containers to open" in message:
             return self._generate_opening_actions(message)
+
+        # End-of-conversation / end-of-phase acknowledgements (silent)
+        if "The conversation has ended" in message or not message.strip():
+            return "Acknowledged."
         
         # Code sharing actions
         # FIXME s isn't printed 
@@ -3913,12 +3917,12 @@ class FormatValidator:
     def validate_container_opening(response, valid_containers):
         """
         Validate container opening format.
-        Returns: (is_valid, containers_to_open, error_message)
+        Returns: (is_valid, containers_to_open, error_message, invalid_selections)
         """
         lines = response.strip().split('\n')
-        
+
         if not lines or lines[0].strip().upper() != "OPEN:":
-            return False, None, "Response must start with 'OPEN:'"
+            return False, None, "Response must start with 'OPEN:'", []
             
         containers = []
         for line in lines[1:]:

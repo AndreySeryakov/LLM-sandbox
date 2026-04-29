@@ -136,6 +136,7 @@ List of what's not done and what comes next.
 - Default system prompts are in code rather than published as a clean `prompts/` folder.
 - No bundled example database / sample-output figure for first-time visitors. Coming.
 - No tests.
+- Move from Langchain 0.3x to 1.x
 
 **Planned experiments:**
 - Birth of cooperation (2–10 agents, no priors).

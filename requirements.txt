@@ -1,7 +1,7 @@
-# Core LLM stack
-langchain
-langchain-core
-langchain-deepseek
+# Core LLM stack — pinned to 0.3.x; 1.x migration is on the roadmap
+langchain<0.4
+langchain-core<0.4
+langchain-deepseek<0.2
 
 # Async + DB
 aiosqlite
