@@ -3999,30 +3999,40 @@ async def main():
 
     # --- DATABASE ---
 
-    # Get timestamped database path
-    db_path = get_db_path()
-    # Backup existing database before running
-    backup_database(db_path)
-
-    # Check if database already exists
-    if os.path.exists(db_path):
-        print(f"Using existing database at: {db_path}")
-        db_manager = DatabaseManager(db_path)
-    else:
-        print(f"Creating new database at: {db_path}")
+    if DRY_RUN:
+        # Scratch DB that is wiped at the start of every dry run, so
+        # dry runs never touch the research timeline.
+        db_path = "conversation_logs/dry_run.db"
+        os.makedirs(os.path.dirname(db_path), exist_ok=True)
+        if os.path.exists(db_path):
+            os.unlink(db_path)
+        print(f"DRY RUN: using scratch database at {db_path} (wiped on each run).")
         db_manager = await initialize_database(db_path)
+    else:
+        db_path = get_db_path()
+        backup_database(db_path)
+        if os.path.exists(db_path):
+            print(f"Using existing database at: {db_path}")
+            db_manager = DatabaseManager(db_path)
+        else:
+            print(f"Creating new database at: {db_path}")
+            db_manager = await initialize_database(db_path)
 
 
     # --- AGENTS ---
-        
+
     # Initialize the agent ID counter based on existing agents
     await initialize_agent_id_counter(db_manager)
 
     # Initialize error collector
     error_collector = ErrorCollector()
 
-    # Create new agents FIXME: specialisations are missing for new agents
-    agents, round_id = await create_mixed_agents(db_manager, new_count=0, library_ids=[1,2])
+    # Create agents per config. FIXME: specialisations are missing for new agents
+    agents, round_id = await create_mixed_agents(
+        db_manager,
+        new_count=config['new_agents_count'],
+        library_ids=config['library_agent_ids'],
+    )
     
 
     # --- CONTAINERS ---
